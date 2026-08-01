@@ -48,9 +48,9 @@ public class AE2Addon {
     private static void registerPayloads(final RegisterPayloadHandlersEvent event) {
         PayloadRegistrar registrar = event.registrar(PROTOCOL_VERSION);
         registrar.playToServer(SetCellModePacket.TYPE, SetCellModePacket.STREAM_CODEC, SetCellModePacket::handle);
-        registrar.playToServer(Mode2ConfigPacket.TYPE, Mode2ConfigPacket.STREAM_CODEC, Mode2ConfigPacket::handle);
-        // type 4（面板数据响应）由服务端发往客户端
-        registrar.playToClient(Mode2ConfigPacket.TYPE, Mode2ConfigPacket.STREAM_CODEC, Mode2ConfigPacket::handle);
+        // Mode2ConfigPacket 双向使用（客户端→服务端指令 + 服务端→客户端面板数据），
+        // 同一 TYPE 只能注册一次，必须用 playBidirectional
+        registrar.playBidirectional(Mode2ConfigPacket.TYPE, Mode2ConfigPacket.STREAM_CODEC, Mode2ConfigPacket::handle);
     }
 
     public static ResourceLocation id(String path) {

@@ -1,6 +1,12 @@
 # AE2 Addon — Infinite Expansion ⚡
 
-**Minecraft 1.20.1 · Forge · AE2 附属模组**
+> **Fork 来源**：本仓库 fork 自 [shengya434/AE2-Infinite-Expansion](https://github.com/shengya434/AE2-Infinite-Expansion)，
+> 由 [Fro2en12](https://github.com/Fro2en12) 维护的 1.21.1 迁移版。
+
+**Minecraft 1.21.1 · NeoForge · AE2 附属模组**
+
+> **迁移说明**：本分支（`port/1.21.1`）已将原 Forge 1.20.1 代码迁移至 NeoForge 21.1.247。
+> 构建与运行需要 JDK 21；依赖版本见 `build.gradle`。
 
 为 AE2 带来真正的无限存储体验！致敬某 MAX 合成存储器与某整合包的增强无限盘。
 
@@ -40,16 +46,16 @@
 
 | 依赖 | 版本 | 必需 |
 |------|:----:|:----:|
-| Forge | ≥ 47.x | ✅ |
-| AE2 | ≥ 15.x | ✅ |
-| JEI | ≥ 15.x | ❌（推荐） |
+| NeoForge | ≥ 21.1.x | ✅ |
+| AE2 | ≥ 19.x | ✅ |
+| JEI | ≥ 19.x | ❌（推荐） |
 
 ---
 
 ## 🛠 开发
 
 ### 前置
-- JDK 17+
+- JDK 21+
 
 ### 编译
 
