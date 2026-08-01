@@ -248,6 +248,10 @@ public class UnlimitedCellInventory implements StorageCell {
         // ── 无限路径：直接收下，不占内部存储 ──
         if (mode == 3) {
             m3.add(what);
+            // 必须持久化 m3：AE2 网络可能复用/重建 inventory 实例，
+            // 不 save 的话 m3 只存在于当前实例，重建后"已插入记录"丢失。
+            dataDirty = true;
+            save();
             return amount;
         }
         if (mode == 2 && workMode == 2) {
@@ -332,39 +336,47 @@ public class UnlimitedCellInventory implements StorageCell {
     }
 
     private static void ensureAllKeysCache() {
-        if (ALL_KEYS_INIT) return;
-        ALL_KEYS_INIT = true;
-        List<AEKey> list = new ArrayList<>();
-
-        Iterator<Item> itemIt = BuiltInRegistries.ITEM.iterator();
-        while (itemIt.hasNext()) {
-            Item item = itemIt.next();
-            try {
-                AEItemKey k = AEItemKey.of(item);
-                if (k != null) {
-                    list.add(k);
-                }
-            } catch (Exception e) {
-                // skip
-            }
+        // 缓存为空时允许重新初始化（防止首次遍历中断导致全类型显示缺失）
+        if (ALL_KEYS_INIT && ALL_KEYS_CACHE != null && !ALL_KEYS_CACHE.isEmpty()) {
+            return;
         }
+        ALL_KEYS_INIT = true;
+        try {
+            List<AEKey> list = new ArrayList<>();
 
-        Iterator<Fluid> fluidIt = BuiltInRegistries.FLUID.iterator();
-        while (fluidIt.hasNext()) {
-            Fluid fluid = fluidIt.next();
-            try {
-                if (fluid != Fluids.EMPTY) {
-                    AEFluidKey k = AEFluidKey.of(fluid);
+            Iterator<Item> itemIt = BuiltInRegistries.ITEM.iterator();
+            while (itemIt.hasNext()) {
+                Item item = itemIt.next();
+                try {
+                    AEItemKey k = AEItemKey.of(item);
                     if (k != null) {
                         list.add(k);
                     }
+                } catch (Throwable e) {
+                    // 整合包 mod 众多，个别物品可能触发 Error（如 NoClassDefFoundError），
+                    // 必须捕获 Throwable 避免中断整个遍历
                 }
-            } catch (Exception e) {
-                // skip
             }
-        }
 
-        ALL_KEYS_CACHE = list;
+            Iterator<Fluid> fluidIt = BuiltInRegistries.FLUID.iterator();
+            while (fluidIt.hasNext()) {
+                Fluid fluid = fluidIt.next();
+                try {
+                    if (fluid != Fluids.EMPTY) {
+                        AEFluidKey k = AEFluidKey.of(fluid);
+                        if (k != null) {
+                            list.add(k);
+                        }
+                    }
+                } catch (Throwable e) {
+                    // skip
+                }
+            }
+
+            ALL_KEYS_CACHE = list;
+        } catch (Throwable t) {
+            ALL_KEYS_CACHE = new ArrayList<>();
+        }
     }
 
     public void getAvailableStacks(KeyCounter out) {
@@ -432,6 +444,10 @@ public class UnlimitedCellInventory implements StorageCell {
     }
 
     public CellState getStatus() {
+        if (mode == 3) {
+            // 全类型无限：始终有内容，避免 AE2 将 cell 视为 ABSENT（空/不可用）
+            return CellState.TYPES_FULL;
+        }
         if (s1.isEmpty() && s2.isEmpty() && wl.isEmpty() && ul.isEmpty()) {
             return CellState.ABSENT;
         }
