@@ -7,6 +7,7 @@ import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.Inventory;
+import net.neoforged.neoforge.network.PacketDistributor;
 
 public class ModeSelectScreen extends AbstractContainerScreen<ModeSelectMenu> {
 
@@ -28,12 +29,12 @@ public class ModeSelectScreen extends AbstractContainerScreen<ModeSelectMenu> {
 
     private Button.Builder btn(String text, int mode) {
         return Button.builder(Component.literal(text), b -> {
-            AE2Addon.NETWORK.sendToServer(new SetCellModePacket(mode));
+            PacketDistributor.sendToServer(new SetCellModePacket(mode));
             this.onClose();
         });
     }
 
-    @Override protected void renderBg(GuiGraphics g, float d, int mx, int my) { renderBackground(g); }
+    @Override protected void renderBg(GuiGraphics g, float d, int mx, int my) { renderBackground(g, mx, my, d); }
 
     @Override
     public void render(GuiGraphics g, int mx, int my, float d) {

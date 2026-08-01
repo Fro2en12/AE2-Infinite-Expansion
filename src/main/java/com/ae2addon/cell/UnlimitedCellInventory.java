@@ -6,7 +6,9 @@ import appeng.api.stacks.*;
 import appeng.api.storage.cells.CellState;
 import appeng.api.storage.cells.ISaveProvider;
 import appeng.api.storage.cells.StorageCell;
+import com.ae2addon.AE2Addon;
 import com.ae2addon.data.CellDataSavedData;
+import net.minecraft.core.HolderLookup;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
@@ -18,7 +20,7 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.Fluids;
-import net.minecraftforge.server.ServerLifecycleHooks;
+import net.neoforged.neoforge.server.ServerLifecycleHooks;
 
 import java.math.BigInteger;
 import java.util.*;
@@ -63,7 +65,7 @@ public class UnlimitedCellInventory implements StorageCell {
     }
 
     private void load() {
-        CompoundTag tag = cellItem.getOrCreateTag();
+        CompoundTag tag = AE2Addon.cellTag(cellItem);
         mode = tag.getInt("umode");
         if (mode < 1 || mode > 3) {
             mode = 1;
@@ -86,6 +88,7 @@ public class UnlimitedCellInventory implements StorageCell {
             uuid = UUID.randomUUID();
             tag.putUUID("uuid", uuid);
         }
+        AE2Addon.setCellTag(cellItem, tag);
         loadFromSavedData();
     }
 
@@ -98,11 +101,11 @@ public class UnlimitedCellInventory implements StorageCell {
         if (level == null) return;
         CellDataSavedData savedData = CellDataSavedData.get(level);
         CellDataSavedData.CellData data = savedData.getOrCreate(uuid);
-        getMapFromNbt(tag, "s1", data.s1);
-        getMapFromNbt(tag, "s2", data.s2);
-        getSetFromNbt(tag, "w", data.wl);
-        getSetFromNbt(tag, "u", data.ul);
-        getMapFromNbtLong(tag, "sa", data.ca);
+        getMapFromNbt(level.registryAccess(), tag, "s1", data.s1);
+        getMapFromNbt(level.registryAccess(), tag, "s2", data.s2);
+        getSetFromNbt(level.registryAccess(), tag, "w", data.wl);
+        getSetFromNbt(level.registryAccess(), tag, "u", data.ul);
+        getMapFromNbtLong(level.registryAccess(), tag, "sa", data.ca);
         savedData.setDirty();
         tag.remove("s1");
         tag.remove("s2");
@@ -176,7 +179,7 @@ public class UnlimitedCellInventory implements StorageCell {
     }
 
     private void updateSummary() {
-        CompoundTag tag = cellItem.getOrCreateTag();
+        CompoundTag tag = AE2Addon.cellTag(cellItem);
         long bytes = 0L;
         int types = 0;
         long infiniteCount = 0;
@@ -224,14 +227,15 @@ public class UnlimitedCellInventory implements StorageCell {
         if (tag.getInt("_t") != types) {
             tag.putInt("_t", types);
         }
+        AE2Addon.setCellTag(cellItem, tag);
     }
 
     public long getCachedBytes() {
-        return cellItem.getOrCreateTag().getLong("_b");
+        return AE2Addon.cellTag(cellItem).getLong("_b");
     }
 
     public int getCachedTypes() {
-        return cellItem.getOrCreateTag().getInt("_t");
+        return AE2Addon.cellTag(cellItem).getInt("_t");
     }
 
     public long insert(AEKey what, long amount, Actionable act, IActionSource src) {
@@ -437,7 +441,9 @@ public class UnlimitedCellInventory implements StorageCell {
 
     public void setMode(int m) {
         mode = m;
-        cellItem.getOrCreateTag().putInt("umode", m);
+        CompoundTag tag = AE2Addon.cellTag(cellItem);
+        tag.putInt("umode", m);
+        AE2Addon.setCellTag(cellItem, tag);
         updateSummary();
         save();
     }
@@ -448,7 +454,9 @@ public class UnlimitedCellInventory implements StorageCell {
 
     public void setThreshold(long t) {
         thr = Math.max(1, Math.min(t, INFINITE));
-        cellItem.getOrCreateTag().putLong("thr", thr);
+        CompoundTag tag = AE2Addon.cellTag(cellItem);
+        tag.putLong("thr", thr);
+        AE2Addon.setCellTag(cellItem, tag);
         save();
     }
 
@@ -509,7 +517,9 @@ public class UnlimitedCellInventory implements StorageCell {
         }
 
         workMode = newWm2;
-        cellItem.getOrCreateTag().putInt("wm", newWm2);
+        CompoundTag tag = AE2Addon.cellTag(cellItem);
+        tag.putInt("wm", newWm2);
+        AE2Addon.setCellTag(cellItem, tag);
         updateSummary();
         dataDirty = true;
         save();
@@ -544,7 +554,7 @@ public class UnlimitedCellInventory implements StorageCell {
         if (key instanceof AEItemKey) {
             AEItemKey itemKey = (AEItemKey) key;
             ItemStack stack = itemKey.toStack();
-            if (stack.hasTag()) {
+            if (stack.has(net.minecraft.core.component.DataComponents.CUSTOM_DATA)) {
                 AEItemKey plain = AEItemKey.of(stack.getItem());
                 if (plain != null && !plain.equals(itemKey)) {
                     return plain;
@@ -655,12 +665,12 @@ public class UnlimitedCellInventory implements StorageCell {
         return server.overworld();
     }
 
-    private static void getMapFromNbt(CompoundTag tag, String key, Map<AEKey, BigInteger> map) {
+    private static void getMapFromNbt(HolderLookup.Provider provider, CompoundTag tag, String key, Map<AEKey, BigInteger> map) {
         map.clear();
         if (!tag.contains(key)) return;
         for (Tag t : tag.getList(key, 10)) {
             CompoundTag ct = (CompoundTag) t;
-            AEKey k = AEKey.fromTagGeneric(ct);
+            AEKey k = AEKey.fromTagGeneric(provider, ct);
             if (k != null) {
                 map.put(k, BigInteger.valueOf(ct.getLong("#")));
             }
@@ -668,23 +678,23 @@ public class UnlimitedCellInventory implements StorageCell {
     }
 
     /** ca 等 Long map 的旧 NBT 迁移 */
-    private static void getMapFromNbtLong(CompoundTag tag, String key, Map<AEKey, Long> map) {
+    private static void getMapFromNbtLong(HolderLookup.Provider provider, CompoundTag tag, String key, Map<AEKey, Long> map) {
         map.clear();
         if (!tag.contains(key)) return;
         for (Tag t : tag.getList(key, 10)) {
             CompoundTag ct = (CompoundTag) t;
-            AEKey k = AEKey.fromTagGeneric(ct);
+            AEKey k = AEKey.fromTagGeneric(provider, ct);
             if (k != null) {
                 map.put(k, ct.getLong("#"));
             }
         }
     }
 
-    private static void getSetFromNbt(CompoundTag tag, String key, Set<AEKey> set) {
+    private static void getSetFromNbt(HolderLookup.Provider provider, CompoundTag tag, String key, Set<AEKey> set) {
         set.clear();
         if (!tag.contains(key)) return;
         for (Tag t : tag.getList(key, 10)) {
-            AEKey k = AEKey.fromTagGeneric((CompoundTag) t);
+            AEKey k = AEKey.fromTagGeneric(provider, (CompoundTag) t);
             if (k != null) {
                 set.add(k);
             }

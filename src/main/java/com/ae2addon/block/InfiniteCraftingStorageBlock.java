@@ -5,7 +5,6 @@ import appeng.block.crafting.CraftingUnitType;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraftforge.fml.util.ObfuscationReflectionHelper;
 import org.jetbrains.annotations.Nullable;
 
 public class InfiniteCraftingStorageBlock extends CraftingUnitBlock {
@@ -17,8 +16,8 @@ public class InfiniteCraftingStorageBlock extends CraftingUnitBlock {
         if (!CLASS_INIT) {
             CLASS_INIT = true;
             try {
-                var f1 = ObfuscationReflectionHelper.findField(
-                        appeng.block.AEBaseEntityBlock.class, "blockEntityClass");
+                // NeoForge 1.21 开发环境直接使用 Mojang 官方映射，字段名无需 SRG 转换
+                var f1 = appeng.block.AEBaseEntityBlock.class.getDeclaredField("blockEntityClass");
                 f1.setAccessible(true);
                 f1.set(this, InfiniteCraftingStorageBE.class);
 

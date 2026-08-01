@@ -9,9 +9,9 @@ import com.ae2addon.cell.UnlimitedCellInventory;
 import com.ae2addon.compat.AppliedECompat;
 import com.ae2addon.item.UniversalStorageCell;
 import net.minecraft.world.item.ItemStack;
-import net.minecraftforge.eventbus.api.SubscribeEvent;
-import net.minecraftforge.fml.common.Mod;
-import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -34,7 +34,7 @@ public class UnlimitedCellHandler implements ICellHandler {
         return new UnlimitedCellInventory(stack, saveProvider);
     }
 
-    @Mod.EventBusSubscriber(modid = AE2Addon.MODID, bus = Mod.EventBusSubscriber.Bus.MOD)
+    @EventBusSubscriber(modid = AE2Addon.MODID)
     public static class Registration {
         @SubscribeEvent
         public static void onCommonSetup(FMLCommonSetupEvent event) {

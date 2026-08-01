@@ -8,6 +8,7 @@ import mezz.jei.api.JeiPlugin;
 import mezz.jei.api.constants.VanillaTypes;
 import mezz.jei.api.registration.IGuiHandlerRegistration;
 import mezz.jei.api.registration.IRecipeRegistration;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
@@ -24,7 +25,7 @@ public class AE2AddonJEIPlugin implements IModPlugin {
 
     @Override
     public ResourceLocation getPluginUid() {
-        return new ResourceLocation(AE2Addon.MODID, "jei_plugin");
+        return ResourceLocation.fromNamespaceAndPath(AE2Addon.MODID, "jei_plugin");
     }
 
     @Override
@@ -34,7 +35,9 @@ public class AE2AddonJEIPlugin implements IModPlugin {
 
         // Mode 1 — 无限制存储
         ItemStack m1 = cellStack.copy();
-        m1.getOrCreateTag().putInt("umode", 1);
+        CompoundTag t1 = AE2Addon.cellTag(m1);
+        t1.putInt("umode", 1);
+        AE2Addon.setCellTag(m1, t1);
         registration.addIngredientInfo(m1, VanillaTypes.ITEM_STACK,
                 Component.literal("§a无限制存储模式"),
                 Component.literal("§7无限容量 · 全AE类型 · 正常存取"),
@@ -45,7 +48,9 @@ public class AE2AddonJEIPlugin implements IModPlugin {
 
         // Mode 2 — 自定义无限
         ItemStack m2 = cellStack.copy();
-        m2.getOrCreateTag().putInt("umode", 2);
+        CompoundTag t2 = AE2Addon.cellTag(m2);
+        t2.putInt("umode", 2);
+        AE2Addon.setCellTag(m2, t2);
         registration.addIngredientInfo(m2, VanillaTypes.ITEM_STACK,
                 Component.literal("§e自定义无限模式"),
                 Component.literal("§7白名单无限 + 通用阈值"),
@@ -60,7 +65,9 @@ public class AE2AddonJEIPlugin implements IModPlugin {
 
         // Mode 3 — 全类型无限
         ItemStack m3 = cellStack.copy();
-        m3.getOrCreateTag().putInt("umode", 3);
+        CompoundTag t3 = AE2Addon.cellTag(m3);
+        t3.putInt("umode", 3);
+        AE2Addon.setCellTag(m3, t3);
         registration.addIngredientInfo(m3, VanillaTypes.ITEM_STACK,
                 Component.literal("§d全类型无限模式"),
                 Component.literal("§7仅物品/流体 · 存入即无限"),

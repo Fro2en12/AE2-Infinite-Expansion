@@ -4,7 +4,7 @@ import com.ae2addon.AE2Addon;
 import com.ae2addon.cell.UnlimitedCellInventory;
 import com.ae2addon.item.UniversalStorageCell;
 import net.minecraft.world.item.ItemStack;
-import net.minecraftforge.fml.ModList;
+import net.neoforged.fml.ModList;
 
 /**
  * EMC兼容（等价交换 ProjectE）。
@@ -43,7 +43,7 @@ public class EMCCompat {
         // 需要根据实际安装的ProjectE版本调整
 
         // 方法1: 通过 IMC 注册 (如果ProjectE支持)
-        // net.minecraftforge.fml.InterModComms.sendTo(
+        // net.neoforged.fml.InterModComms.sendTo(
         //     "projecte", "register_emc_provider",
         //     () -> (IEMCProvider) (item, emcMap) -> {
         //         if (item.getItem() instanceof UniversalStorageCell) {

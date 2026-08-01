@@ -1,6 +1,7 @@
 package com.ae2addon.data;
 
 import appeng.api.stacks.AEKey;
+import net.minecraft.core.HolderLookup;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
@@ -28,7 +29,8 @@ public class CellDataSavedData extends SavedData {
     // ── 获取实例 ──
 
     public static CellDataSavedData get(ServerLevel level) {
-        return level.getDataStorage().computeIfAbsent(CellDataSavedData::load, CellDataSavedData::new, DATA_NAME);
+        return level.getDataStorage().computeIfAbsent(
+                new SavedData.Factory<>(CellDataSavedData::new, CellDataSavedData::load), DATA_NAME);
     }
 
     // ── 数据操作 ──
@@ -62,26 +64,26 @@ public class CellDataSavedData extends SavedData {
     // ── NBT 序列化 ──
 
     @Override
-    public @NotNull CompoundTag save(@NotNull CompoundTag tag) {
+    public @NotNull CompoundTag save(@NotNull CompoundTag tag, HolderLookup.Provider registries) {
         ListTag list = new ListTag();
         for (var entry : cells.entrySet()) {
             CompoundTag cellTag = new CompoundTag();
             cellTag.putUUID("uuid", entry.getKey());
-            entry.getValue().save(cellTag);
+            entry.getValue().save(cellTag, registries);
             list.add(cellTag);
         }
         tag.put("cells", list);
         return tag;
     }
 
-    public static CellDataSavedData load(CompoundTag tag) {
+    public static CellDataSavedData load(CompoundTag tag, HolderLookup.Provider registries) {
         CellDataSavedData data = new CellDataSavedData();
         if (tag.contains("cells", Tag.TAG_LIST)) {
             ListTag list = tag.getList("cells", Tag.TAG_COMPOUND);
             for (Tag t : list) {
                 CompoundTag cellTag = (CompoundTag) t;
                 UUID uuid = cellTag.getUUID("uuid");
-                CellData cellData = CellData.load(cellTag);
+                CellData cellData = CellData.load(cellTag, registries);
                 data.cells.put(uuid, cellData);
             }
         }
@@ -105,23 +107,23 @@ public class CellDataSavedData extends SavedData {
         /** Mode 3 已插入的物品（含 NBT 变体），跨存档持久化 */
         public final Set<AEKey> m3 = new HashSet<>();
 
-        public void save(CompoundTag tag) {
-            putBigIntMap(tag, "s1", s1);
-            putBigIntMap(tag, "s2", s2);
-            putSet(tag, "wl", wl);
-            putSet(tag, "ul", ul);
-            putLongMap(tag, "ca", ca);
-            putSet(tag, "m3", m3);
+        public void save(CompoundTag tag, HolderLookup.Provider registries) {
+            putBigIntMap(tag, "s1", s1, registries);
+            putBigIntMap(tag, "s2", s2, registries);
+            putSet(tag, "wl", wl, registries);
+            putSet(tag, "ul", ul, registries);
+            putLongMap(tag, "ca", ca, registries);
+            putSet(tag, "m3", m3, registries);
         }
 
-        public static CellData load(CompoundTag tag) {
+        public static CellData load(CompoundTag tag, HolderLookup.Provider registries) {
             CellData data = new CellData();
-            getBigIntMap(tag, "s1", data.s1);
-            getBigIntMap(tag, "s2", data.s2);
-            getSet(tag, "wl", data.wl);
-            getSet(tag, "ul", data.ul);
-            getLongMap(tag, "ca", data.ca);
-            getSet(tag, "m3", data.m3);
+            getBigIntMap(tag, "s1", data.s1, registries);
+            getBigIntMap(tag, "s2", data.s2, registries);
+            getSet(tag, "wl", data.wl, registries);
+            getSet(tag, "ul", data.ul, registries);
+            getLongMap(tag, "ca", data.ca, registries);
+            getSet(tag, "m3", data.m3, registries);
             return data;
         }
 
@@ -162,10 +164,11 @@ public class CellDataSavedData extends SavedData {
         // ── NBT 工具 ──
 
         /** 写 BigInteger map：以 byte array 格式存储 */
-        private static void putBigIntMap(CompoundTag t, String k, Map<AEKey, BigInteger> m) {
+        private static void putBigIntMap(CompoundTag t, String k, Map<AEKey, BigInteger> m,
+                                         HolderLookup.Provider registries) {
             ListTag l = new ListTag();
             for (var e : m.entrySet()) {
-                CompoundTag n = e.getKey().toTagGeneric();
+                CompoundTag n = e.getKey().toTagGeneric(registries);
                 n.putByteArray("#", e.getValue().toByteArray());
                 l.add(n);
             }
@@ -177,12 +180,13 @@ public class CellDataSavedData extends SavedData {
          * 旧格式：e.contains("#", TAG_LONG)
          * 新格式：e.contains("#", TAG_BYTE_ARRAY)
          */
-        private static void getBigIntMap(CompoundTag t, String k, Map<AEKey, BigInteger> m) {
+        private static void getBigIntMap(CompoundTag t, String k, Map<AEKey, BigInteger> m,
+                                         HolderLookup.Provider registries) {
             m.clear();
             if (!t.contains(k)) return;
             for (Tag tag : t.getList(k, Tag.TAG_COMPOUND)) {
                 CompoundTag e = (CompoundTag) tag;
-                AEKey key = AEKey.fromTagGeneric(e);
+                AEKey key = AEKey.fromTagGeneric(registries, e);
                 if (key == null) continue;
                 if (e.contains("#", Tag.TAG_BYTE_ARRAY)) {
                     m.put(key, new BigInteger(e.getByteArray("#")));
@@ -194,10 +198,11 @@ public class CellDataSavedData extends SavedData {
         }
 
         /** 写 Long map：ca 等仍用 long 存储 */
-        private static void putLongMap(CompoundTag t, String k, Map<AEKey, Long> m) {
+        private static void putLongMap(CompoundTag t, String k, Map<AEKey, Long> m,
+                                       HolderLookup.Provider registries) {
             ListTag l = new ListTag();
             for (var e : m.entrySet()) {
-                CompoundTag n = e.getKey().toTagGeneric();
+                CompoundTag n = e.getKey().toTagGeneric(registries);
                 n.putLong("#", e.getValue());
                 l.add(n);
             }
@@ -205,27 +210,28 @@ public class CellDataSavedData extends SavedData {
         }
 
         /** 读 Long map */
-        private static void getLongMap(CompoundTag t, String k, Map<AEKey, Long> m) {
+        private static void getLongMap(CompoundTag t, String k, Map<AEKey, Long> m,
+                                       HolderLookup.Provider registries) {
             m.clear();
             if (!t.contains(k)) return;
             for (Tag tag : t.getList(k, Tag.TAG_COMPOUND)) {
                 CompoundTag e = (CompoundTag) tag;
-                AEKey key = AEKey.fromTagGeneric(e);
+                AEKey key = AEKey.fromTagGeneric(registries, e);
                 if (key != null) m.put(key, e.getLong("#"));
             }
         }
 
-        private static void putSet(CompoundTag t, String k, Set<AEKey> s) {
+        private static void putSet(CompoundTag t, String k, Set<AEKey> s, HolderLookup.Provider registries) {
             ListTag l = new ListTag();
-            for (AEKey key : s) l.add(key.toTagGeneric());
+            for (AEKey key : s) l.add(key.toTagGeneric(registries));
             t.put(k, l);
         }
 
-        private static void getSet(CompoundTag t, String k, Set<AEKey> s) {
+        private static void getSet(CompoundTag t, String k, Set<AEKey> s, HolderLookup.Provider registries) {
             s.clear();
             if (!t.contains(k)) return;
             for (Tag tag : t.getList(k, Tag.TAG_COMPOUND)) {
-                AEKey key = AEKey.fromTagGeneric((CompoundTag) tag);
+                AEKey key = AEKey.fromTagGeneric(registries, (CompoundTag) tag);
                 if (key != null) s.add(key);
             }
         }

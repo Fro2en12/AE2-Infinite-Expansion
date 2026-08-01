@@ -1,7 +1,8 @@
 package com.ae2addon.gui;
 
 import com.ae2addon.init.ModMenuTypes;
-import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.AbstractContainerMenu;
@@ -24,8 +25,8 @@ public class ModeSelectMenu extends AbstractContainerMenu {
     /**
      * 从网络数据包创建（服务端→客户端同步）
      */
-    public static ModeSelectMenu fromNetwork(int id, Inventory inv, FriendlyByteBuf buf) {
-        ItemStack stack = buf.readItem();
+    public static ModeSelectMenu fromNetwork(int id, Inventory inv, RegistryFriendlyByteBuf buf) {
+        ItemStack stack = ItemStack.OPTIONAL_STREAM_CODEC.decode(buf);
         return new ModeSelectMenu(id, inv, stack);
     }
 

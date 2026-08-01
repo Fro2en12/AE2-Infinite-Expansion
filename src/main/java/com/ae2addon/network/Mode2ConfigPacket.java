@@ -6,32 +6,42 @@ import appeng.api.stacks.AEFluidKey;
 import com.ae2addon.cell.UnlimitedCellInventory;
 import com.ae2addon.item.UniversalStorageCell;
 import net.minecraft.nbt.CompoundTag;
-import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.material.Fluids;
-import net.minecraftforge.common.capabilities.ForgeCapabilities;
-import net.minecraftforge.fluids.FluidStack;
-import net.minecraftforge.fluids.capability.IFluidHandlerItem;
-import net.minecraftforge.network.NetworkEvent;
-import net.minecraftforge.network.PacketDistributor;
+import net.neoforged.neoforge.capabilities.Capabilities;
+import net.neoforged.neoforge.fluids.FluidStack;
+import net.neoforged.neoforge.fluids.capability.IFluidHandlerItem;
+import net.neoforged.neoforge.network.PacketDistributor;
+import net.neoforged.neoforge.network.handling.IPayloadContext;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
-import java.util.function.Supplier;
 
 /**
- * 模式2配置数据包：
+ * 模式2配置数据包（NeoForge 1.21 payload，双向）：
  * type 0 = 设置阈值
  * type 1 = 加入白名单（传完整ItemStack，自动检测流体容器）
  * type 2 = 移除白名单项
  * type 3 = 请求面板数据（客户端→服务端）
  * type 4 = 面板数据响应（服务端→客户端，支持分包）
  * type 5 = 切换无限状态（客户端→服务端，传完整AEKey NBT）
+ * type 6 = 设置工作模式（客户端→服务端）
  */
-public class Mode2ConfigPacket {
+public class Mode2ConfigPacket implements CustomPacketPayload {
+
+    public static final Type<Mode2ConfigPacket> TYPE = new Type<>(
+            ResourceLocation.fromNamespaceAndPath("ae2addon", "mode2_config"));
+
+    public static final StreamCodec<RegistryFriendlyByteBuf, Mode2ConfigPacket> STREAM_CODEC = StreamCodec.of(
+            (buf, packet) -> encode(packet, buf),
+            Mode2ConfigPacket::decode
+    );
 
     private final int type;
     private final long threshold;
@@ -124,17 +134,17 @@ public class Mode2ConfigPacket {
         this.totalChunks = 1;
     }
 
-    public static void encode(Mode2ConfigPacket p, FriendlyByteBuf buf) {
+    public static void encode(Mode2ConfigPacket p, RegistryFriendlyByteBuf buf) {
         buf.writeByte(p.type);
 
         if (p.type == 1) {
-            buf.writeItem(p.clickedStack);
+            ItemStack.OPTIONAL_STREAM_CODEC.encode(buf, p.clickedStack);
         } else if (p.type == 4 && p.panelItems != null) {
             buf.writeVarInt(p.chunkIndex);
             buf.writeVarInt(p.totalChunks);
             buf.writeVarInt(p.panelItems.size());
             for (var entry : p.panelItems) {
-                buf.writeNbt(entry.key.toTagGeneric());
+                buf.writeNbt(entry.key.toTagGeneric(buf.registryAccess()));
                 buf.writeVarLong(entry.amount);
                 buf.writeBoolean(entry.isInfinite);
                 buf.writeVarLong(entry.bytes);
@@ -149,11 +159,11 @@ public class Mode2ConfigPacket {
         }
     }
 
-    public static Mode2ConfigPacket decode(FriendlyByteBuf buf) {
+    public static Mode2ConfigPacket decode(RegistryFriendlyByteBuf buf) {
         int type = buf.readByte();
 
         if (type == 1) {
-            return new Mode2ConfigPacket(buf.readItem());
+            return new Mode2ConfigPacket(ItemStack.OPTIONAL_STREAM_CODEC.decode(buf));
         }
 
         if (type == 4) {
@@ -164,7 +174,7 @@ public class Mode2ConfigPacket {
             for (int i = 0; i < count; i++) {
                 CompoundTag tag = buf.readNbt();
                 if (tag == null) continue;
-                AEKey key = AEKey.fromTagGeneric(tag);
+                AEKey key = AEKey.fromTagGeneric(buf.registryAccess(), tag);
                 if (key == null) continue;
                 long amount = buf.readVarLong();
                 boolean isInfinite = buf.readBoolean();
@@ -186,26 +196,24 @@ public class Mode2ConfigPacket {
         return new Mode2ConfigPacket(type, buf.readLong(), buf.readUtf());
     }
 
-    public static void handle(Mode2ConfigPacket p, Supplier<NetworkEvent.Context> ctx) {
-        var side = ctx.get().getDirection().getReceptionSide();
+    @Override
+    public Type<Mode2ConfigPacket> type() {
+        return TYPE;
+    }
 
-        if (side.isClient() && p.type == 4) {
-            ctx.get().enqueueWork(() -> {
-                com.ae2addon.gui.Mode2ConfigScreen.handlePanelDataChunk(
-                        p.panelItems, p.chunkIndex, p.totalChunks);
-            });
-            ctx.get().setPacketHandled(true);
+    public static void handle(final Mode2ConfigPacket p, final IPayloadContext ctx) {
+        // 服务端 → 客户端：仅 type 4（面板数据响应）
+        if (ctx.flow().isClientbound()) {
+            if (p.type == 4) {
+                ctx.enqueueWork(() -> com.ae2addon.gui.Mode2ConfigScreen.handlePanelDataChunk(
+                        p.panelItems, p.chunkIndex, p.totalChunks));
+            }
             return;
         }
 
-        if (!side.isServer()) {
-            ctx.get().setPacketHandled(true);
-            return;
-        }
-
-        ctx.get().enqueueWork(() -> {
-            ServerPlayer player = ctx.get().getSender();
-            if (player == null) return;
+        // 客户端 → 服务端
+        ctx.enqueueWork(() -> {
+            if (!(ctx.player() instanceof ServerPlayer player)) return;
 
             ItemStack stack = player.getMainHandItem();
             if (!(stack.getItem() instanceof UniversalStorageCell)) {
@@ -227,7 +235,7 @@ public class Mode2ConfigPacket {
 
             } else if (p.type == 2 && !p.itemId.isEmpty()) {
                 // 移除白名单项
-                handleRemoveFromWhitelist(inv, p.itemId);
+                handleRemoveFromWhitelist(inv, p.itemId, player.level().registryAccess());
 
             } else if (p.type == 3) {
                 sendPanelRefresh(inv, player);
@@ -247,7 +255,6 @@ public class Mode2ConfigPacket {
                 sendPanelRefresh(inv, player);
             }
         });
-        ctx.get().setPacketHandled(true);
     }
 
     /** 分包发送面板刷新数据：每包最多 MAX_ITEMS_PER_CHUNK 个 item */
@@ -261,10 +268,7 @@ public class Mode2ConfigPacket {
             int from = i * MAX_ITEMS_PER_CHUNK;
             int to = Math.min(from + MAX_ITEMS_PER_CHUNK, total);
             List<UnlimitedCellInventory.PanelItem> chunk = allItems.subList(from, to);
-            com.ae2addon.AE2Addon.NETWORK.send(
-                    PacketDistributor.PLAYER.with(() -> player),
-                    new Mode2ConfigPacket(chunk, i, totalChunks)
-            );
+            PacketDistributor.sendToPlayer(player, new Mode2ConfigPacket(chunk, i, totalChunks));
         }
     }
 
@@ -294,18 +298,19 @@ public class Mode2ConfigPacket {
 
     /** 检测物品是否有流体容器能力 */
     private static FluidStack getFluidFromContainer(ItemStack stack) {
-        Optional<IFluidHandlerItem> handler = stack.getCapability(ForgeCapabilities.FLUID_HANDLER_ITEM).resolve();
-        if (handler.isPresent()) {
-            return handler.get().getFluidInTank(0);
+        IFluidHandlerItem handler = stack.getCapability(Capabilities.FluidHandler.ITEM);
+        if (handler != null) {
+            return handler.getFluidInTank(0);
         }
         return FluidStack.EMPTY;
     }
 
     /** 移除白名单项 */
-    private static void handleRemoveFromWhitelist(UnlimitedCellInventory inv, String itemId) {
+    private static void handleRemoveFromWhitelist(UnlimitedCellInventory inv, String itemId,
+                                                  net.minecraft.core.HolderLookup.Provider provider) {
         // 遍历白名单，按 id 匹配移除
         for (AEKey key : inv.getWl()) {
-            CompoundTag tag = key.toTagGeneric();
+            CompoundTag tag = key.toTagGeneric(provider);
             if (itemId.equals(tag.getString("id"))) {
                 inv.removeWl(key);
                 return;
@@ -319,7 +324,7 @@ public class Mode2ConfigPacket {
                                               CompoundTag keyTag, ServerPlayer player) {
         if (keyTag == null) return;
 
-        AEKey key = AEKey.fromTagGeneric(keyTag);
+        AEKey key = AEKey.fromTagGeneric(player.level().registryAccess(), keyTag);
         if (key == null) return;
 
         boolean wasInfinite = inv.getUl().contains(key) || inv.getWl().contains(key);
@@ -339,7 +344,7 @@ public class Mode2ConfigPacket {
     private static void outputItems(ServerPlayer player, AEKey key, long amount) {
         if (!(key instanceof AEItemKey itemKey)) return;
 
-        int maxStackSize = itemKey.getItem().getMaxStackSize();
+        int maxStackSize = itemKey.toStack().getMaxStackSize();
         long remaining = amount;
 
         while (remaining > 0) {

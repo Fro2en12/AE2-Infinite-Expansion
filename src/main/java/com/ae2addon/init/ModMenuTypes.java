@@ -5,9 +5,9 @@ import com.ae2addon.gui.Mode2ConfigMenu;
 import com.ae2addon.gui.ModeSelectMenu;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.world.inventory.MenuType;
-import net.minecraftforge.common.extensions.IForgeMenuType;
-import net.minecraftforge.registries.DeferredRegister;
-import net.minecraftforge.registries.RegistryObject;
+import net.neoforged.neoforge.common.extensions.IMenuTypeExtension;
+import net.neoforged.neoforge.registries.DeferredHolder;
+import net.neoforged.neoforge.registries.DeferredRegister;
 
 /**
  * 菜单类型注册
@@ -18,12 +18,12 @@ public class ModMenuTypes {
             DeferredRegister.create(Registries.MENU, AE2Addon.MODID);
 
     // 模式选择界面
-    public static final RegistryObject<MenuType<ModeSelectMenu>> MODE_SELECT =
+    public static final DeferredHolder<MenuType<?>, MenuType<ModeSelectMenu>> MODE_SELECT =
             MENUS.register("mode_select",
-                    () -> IForgeMenuType.create(ModeSelectMenu::fromNetwork));
+                    () -> IMenuTypeExtension.create(ModeSelectMenu::fromNetwork));
 
     // 模式2配置界面
-    public static final RegistryObject<MenuType<Mode2ConfigMenu>> MODE2_CONFIG =
+    public static final DeferredHolder<MenuType<?>, MenuType<Mode2ConfigMenu>> MODE2_CONFIG =
             MENUS.register("mode2_config",
-                    () -> IForgeMenuType.create(Mode2ConfigMenu::fromNetwork));
+                    () -> IMenuTypeExtension.create(Mode2ConfigMenu::fromNetwork));
 }

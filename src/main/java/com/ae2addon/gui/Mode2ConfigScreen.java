@@ -17,6 +17,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.TooltipFlag;
+import net.neoforged.neoforge.network.PacketDistributor;
 
 import net.sourceforge.pinyin4j.PinyinHelper;
 import net.sourceforge.pinyin4j.format.HanyuPinyinCaseType;
@@ -112,7 +113,7 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         try {
             long v = Long.parseLong(thresholdInput.getValue());
             v = Math.max(1, Math.min(v, Long.MAX_VALUE));
-            AE2Addon.NETWORK.sendToServer(new Mode2ConfigPacket(0, v, ""));
+            PacketDistributor.sendToServer(new Mode2ConfigPacket(0, v, ""));
             thresholdInput.setValue(String.valueOf(v));
         } catch (NumberFormatException ignored) {
             thresholdInput.setValue(String.valueOf(menu.getThreshold()));
@@ -138,7 +139,7 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         addRenderableWidget(Button.builder(
                 Component.literal("§7← 返回"),
                 b -> {
-                    AE2Addon.NETWORK.sendToServer(new SetCellModePacket(0));
+                    PacketDistributor.sendToServer(new SetCellModePacket(0));
                     onClose();
                 }
         ).bounds(cx - 30, topPos + 102, 60, 16).build());
@@ -186,13 +187,13 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
 
     private void cycleWorkMode() {
         currentWorkMode = (currentWorkMode % 3) + 1;
-        AE2Addon.NETWORK.sendToServer(new Mode2ConfigPacket(6, currentWorkMode));
+        PacketDistributor.sendToServer(new Mode2ConfigPacket(6, currentWorkMode));
         rebuildWidgets();
     }
 
     private void enterWorkMode(int wm) {
         currentWorkMode = wm;
-        AE2Addon.NETWORK.sendToServer(new Mode2ConfigPacket(6, wm));
+        PacketDistributor.sendToServer(new Mode2ConfigPacket(6, wm));
         uiState = 1;
         rebuildWidgets();
     }
@@ -346,7 +347,7 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
 
     @Override
     protected void renderBg(GuiGraphics g, float d, int mx, int my) {
-        renderBackground(g);
+        renderBackground(g, mx, my, d);
     }
 
     @Override
@@ -422,7 +423,8 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
             var flag = mc.options.advancedItemTooltips
                     ? TooltipFlag.Default.ADVANCED
                     : TooltipFlag.Default.NORMAL;
-            List<Component> lines = new ArrayList<>(stack.getTooltipLines(mc.player, flag));
+            List<Component> lines = new ArrayList<>(stack.getTooltipLines(
+                    net.minecraft.world.item.Item.TooltipContext.of(mc.level), mc.player, flag));
             if (entry.isInfinite) {
                 // 在 tooltip 最下方追加 ∞ 标记
                 lines.add(Component.literal(""));
@@ -612,7 +614,8 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
             int row = getClickedRow(mx, my);
             if (row >= 0 && row < filteredItems.size()) {
                 if (hasShiftDown()) {
-                    menu.sendToggleInfinite(filteredItems.get(row).key.toTagGeneric());
+                    menu.sendToggleInfinite(filteredItems.get(row).key.toTagGeneric(
+                            Minecraft.getInstance().level.registryAccess()));
                     return true;
                 }
                 return true;
@@ -623,17 +626,17 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
     }
 
     @Override
-    public boolean mouseScrolled(double mx, double my, double delta) {
-        if (uiState == 0) return super.mouseScrolled(mx, my, delta);
+    public boolean mouseScrolled(double mx, double my, double horizontal, double vertical) {
+        if (uiState == 0) return super.mouseScrolled(mx, my, horizontal, vertical);
         if (isInPanelArea(mx, my)) {
-            if (delta < 0) {
+            if (vertical < 0) {
                 scrollOffset = Math.min(scrollOffset + 1, Math.max(0, filteredItems.size() - maxVisibleRows));
-            } else if (delta > 0) {
+            } else if (vertical > 0) {
                 scrollOffset = Math.max(scrollOffset - 1, 0);
             }
             return true;
         }
-        return super.mouseScrolled(mx, my, delta);
+        return super.mouseScrolled(mx, my, horizontal, vertical);
     }
 
     @Override

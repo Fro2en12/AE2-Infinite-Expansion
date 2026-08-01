@@ -1,7 +1,7 @@
 package com.ae2addon.compat;
 
 import com.ae2addon.AE2Addon;
-import net.minecraftforge.fml.ModList;
+import net.neoforged.fml.ModList;
 
 /**
  * AppliedE兼容 — 为万能无限元件注册EMC通道支持。

@@ -5,12 +5,14 @@ import com.ae2addon.cell.UnlimitedCellInventory;
 import com.ae2addon.init.ModMenuTypes;
 import com.ae2addon.network.Mode2ConfigPacket;
 import net.minecraft.nbt.CompoundTag;
-import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.Slot;
 import net.minecraft.world.item.ItemStack;
+import net.neoforged.neoforge.network.PacketDistributor;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -49,25 +51,25 @@ public class Mode2ConfigMenu extends AbstractContainerMenu {
         }
     }
 
-    public static Mode2ConfigMenu fromNetwork(int id, Inventory inv, FriendlyByteBuf buf) {
-        return new Mode2ConfigMenu(id, inv, buf.readItem());
+    public static Mode2ConfigMenu fromNetwork(int id, Inventory inv, RegistryFriendlyByteBuf buf) {
+        return new Mode2ConfigMenu(id, inv, ItemStack.OPTIONAL_STREAM_CODEC.decode(buf));
     }
 
     public ItemStack getCellStack() { return cellStack; }
 
     public long getThreshold() {
-        return cellStack.getOrCreateTag().getLong("thr");
+        return com.ae2addon.AE2Addon.cellTag(cellStack).getLong("thr");
     }
 
     public int getWorkMode() {
-        int wm = cellStack.getOrCreateTag().getInt("wm");
+        int wm = com.ae2addon.AE2Addon.cellTag(cellStack).getInt("wm");
         if (wm < 1 || wm > 3) wm = 1;
         return wm;
     }
 
     /** 请求服务端发送面板数据 */
     public void requestPanelData() {
-        AE2Addon.NETWORK.sendToServer(new Mode2ConfigPacket(3));
+        PacketDistributor.sendToServer(new Mode2ConfigPacket(3));
     }
 
     /** 客户端更新面板数据（从网络包接收） */
@@ -82,7 +84,7 @@ public class Mode2ConfigMenu extends AbstractContainerMenu {
 
     /** 切换无限状态：发送完整 AEKey NBT 到服务端 */
     public void sendToggleInfinite(CompoundTag keyTag) {
-        AE2Addon.NETWORK.sendToServer(new Mode2ConfigPacket(keyTag));
+        PacketDistributor.sendToServer(new Mode2ConfigPacket(keyTag));
     }
 
     /** 点击背包物品 → 加入白名单（自动检测流体容器） */
@@ -93,7 +95,7 @@ public class Mode2ConfigMenu extends AbstractContainerMenu {
         ItemStack clicked = slot.getItem();
 
         // 发送完整 ItemStack（含 NBT，以便服务端检测流体等内部存储）
-        AE2Addon.NETWORK.sendToServer(new Mode2ConfigPacket(clicked.copy()));
+        PacketDistributor.sendToServer(new Mode2ConfigPacket(clicked.copy()));
         return ItemStack.EMPTY;
     }
 

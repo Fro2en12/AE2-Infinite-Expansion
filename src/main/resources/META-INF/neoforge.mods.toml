@@ -1,5 +1,5 @@
 modLoader="javafml"
-loaderVersion="[47,)"
+loaderVersion="[4,)"
 license="LGPL-3.0"
 
 [[mods]]
@@ -29,22 +29,32 @@ description='''
 '''
 
 [[dependencies.ae2addon]]
-    modId="forge"
-    mandatory=true
-    versionRange="[47,)"
+    modId="neoforge"
+    type="required"
+    versionRange="[21.1,)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.ae2addon]]
+    modId="minecraft"
+    type="required"
+    versionRange="[1.21.1,1.22)"
     ordering="NONE"
     side="BOTH"
 
 [[dependencies.ae2addon]]
     modId="ae2"
-    mandatory=true
-    versionRange="[15,)"
+    type="required"
+    versionRange="[19,)"
     ordering="NONE"
     side="BOTH"
 
 [[dependencies.ae2addon]]
     modId="jei"
-    mandatory=false
-    versionRange="[15,)"
+    type="optional"
+    versionRange="[19,)"
     ordering="NONE"
     side="BOTH"
+
+[[mixin]]
+config="ae2addon.mixins.json"

@@ -1,63 +1,44 @@
 plugins {
-    id 'net.minecraftforge.gradle' version '[6.0.16,6.2)'
-    id 'org.parchmentmc.librarian.forgegradle' version '1.+'
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.143'
+}
+
+base {
+    archivesName = 'ae2-addon'
 }
 
 java {
-    toolchain.languageVersion = JavaLanguageVersion.of(17)
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
 }
 
-minecraft {
-    mappings channel: 'parchment', version: '2023.09.03-1.20.1'
+neoForge {
+    version = '21.1.247'
 
     runs {
         client {
-            workingDirectory project.file('run')
-            property 'forge.logging.markers', 'REGISTRIES'
-            property 'forge.logging.console.level', 'debug'
-            // Mixin refmap remapping
-            property 'mixin.env.remapRefMap', 'true'
-            property 'mixin.env.refMapRemappingFile', "${project.buildDir}/createSrgToMcp/output.srg"
-            mods {
-                ae2addon {
-                    source sourceSets.main
-                }
-            }
+            client()
+            systemProperty 'forge.logging.markers', 'REGISTRIES'
+            systemProperty 'forge.logging.console.level', 'debug'
         }
-
         server {
-            workingDirectory project.file('run')
-            property 'forge.logging.markers', 'REGISTRIES'
-            property 'forge.logging.console.level', 'debug'
-            // Mixin refmap remapping
-            property 'mixin.env.remapRefMap', 'true'
-            property 'mixin.env.refMapRemappingFile', "${project.buildDir}/createSrgToMcp/output.srg"
-            mods {
-                ae2addon {
-                    source sourceSets.main
-                }
-            }
+            server()
+            systemProperty 'forge.logging.markers', 'REGISTRIES'
+            systemProperty 'forge.logging.console.level', 'debug'
         }
-
         data {
-            workingDirectory project.file('run')
-            property 'forge.logging.markers', 'REGISTRIES'
-            property 'forge.logging.console.level', 'debug'
-            // Mixin refmap remapping
-            property 'mixin.env.remapRefMap', 'true'
-            property 'mixin.env.refMapRemappingFile', "${project.buildDir}/createSrgToMcp/output.srg"
-            args '--mod', 'ae2addon', '--all', '--output', file('src/generated/resources/'), '--existing', file('src/main/resources/')
-            mods {
-                ae2addon {
-                    source sourceSets.main
-                }
-            }
+            data()
+            programArguments.addAll '--mod', 'ae2addon', '--all', '--output', file('src/generated/resources/').getAbsolutePath(), '--existing', file('src/main/resources/').getAbsolutePath()
+        }
+    }
+
+    mods {
+        ae2addon {
+            sourceSet sourceSets.main
         }
     }
 }
 
 repositories {
-    // Modrinth Maven — 从这里获取AE2
     maven {
         name = "Modrinth"
         url = "https://api.modrinth.com/maven"
@@ -65,17 +46,9 @@ repositories {
             includeGroup "maven.modrinth"
         }
     }
-    // JEI 官方 Maven（主 + 备用）
     maven {
         name = "JEI"
         url = "https://maven.blamejared.com/"
-        content {
-            includeGroup "mezz.jei"
-        }
-    }
-    maven {
-        name = "JEI Backup"
-        url = "https://dvs1.progwml6.com/files/maven/"
         content {
             includeGroup "mezz.jei"
         }
@@ -89,28 +62,26 @@ configurations {
 }
 
 dependencies {
-    minecraft 'net.minecraftforge:forge:1.20.1-47.3.0'
+    implementation "net.neoforged:neoforge:21.1.247"
 
-    // Mixin annotation processor（编译时生成 refmap）
-    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+    // Mixin 注解处理器（NeoForge 1.21 运行时自带 Mixin 0.8.7）
+    compileOnly "org.spongepowered:mixin:0.8.7"
+    annotationProcessor "org.spongepowered:mixin:0.8.7:processor"
 
     // 拼音搜索支持 — 嵌入到mod jar中
     embed 'com.belerweb:pinyin4j:2.5.1'
 
-    // AE2 15.4.10 for Forge 1.20.1 — 通过Modrinth Maven获取
-    implementation fg.deobf("maven.modrinth:ae2:15.4.10")
-    implementation fg.deobf("maven.modrinth:guideme:20.1.15")
+    // AE2 19.2.17 for NeoForge 1.21.1 — 通过 Modrinth Maven 获取
+    implementation "maven.modrinth:ae2:19.2.17"
+    implementation "maven.modrinth:guideme:21.1.17"
 
-    // JEI 15.20.0.132 for 1.20.1 — 通过官方Maven获取（避免映射兼容问题）
-    // compileOnly + runtimeOnly 都用完整jar防止API artifact缺失
-    compileOnly fg.deobf("mezz.jei:jei-1.20.1-forge:15.20.0.132")
-    runtimeOnly fg.deobf("mezz.jei:jei-1.20.1-forge:15.20.0.132")
+    // JEI 19.43.0.390 for 1.21.1 NeoForge
+    compileOnly "mezz.jei:jei-1.21.1-neoforge:19.43.0.390"
+    runtimeOnly "mezz.jei:jei-1.21.1-neoforge:19.43.0.390"
 
-    // AppliedE — 用于EMC通道注册（反射调用，无硬依赖）
-    runtimeOnly fg.deobf("maven.modrinth:appliede:0.14.3")
-
-    // AppliedE — EMC与AE2桥接（编译时需要，运行时可选）
-    compileOnly fg.deobf("maven.modrinth:SyKS54UY:0.14.3")  // AppliedE 0.14.3
+    // AppliedE 1.0.8-beta（NeoForge 1.21.1）— EMC 通道注册（编译+运行）
+    compileOnly "maven.modrinth:appliede:1.0.8-beta"
+    runtimeOnly "maven.modrinth:appliede:1.0.8-beta"
 }
 
 jar {
@@ -126,9 +97,7 @@ jar {
                 "Implementation-Title"    : project.name,
                 "Implementation-Version"  : project.jar.archiveVersion,
                 "Implementation-Vendor"   : "Tendo Alice",
-                "Implementation-Timestamp": new Date().format("yyyy-MM-dd'T'HH:mm:ssZ"),
-                "MixinConfigs"            : "ae2addon.mixins.json",
-                "MixinConnector"          : "com.ae2addon.mixin.Connector"
+                "Implementation-Timestamp": new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
         ])
     }
 }

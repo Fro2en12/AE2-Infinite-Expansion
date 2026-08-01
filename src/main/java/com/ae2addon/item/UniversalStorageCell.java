@@ -5,6 +5,7 @@ import appeng.api.storage.cells.ICellWorkbenchItem;
 import appeng.api.upgrades.IUpgradeInventory;
 import appeng.api.upgrades.UpgradeInventories;
 import appeng.util.ConfigInventory;
+import com.ae2addon.AE2Addon;
 import com.ae2addon.gui.ModeSelectMenu;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
@@ -20,7 +21,6 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Rarity;
 import net.minecraft.world.item.TooltipFlag;
 import net.minecraft.world.level.Level;
-import net.minecraftforge.network.NetworkHooks;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.List;
@@ -48,11 +48,12 @@ public class UniversalStorageCell extends Item implements ICellWorkbenchItem {
         if (level.isClientSide) return InteractionResultHolder.success(stack);
 
         if (player instanceof ServerPlayer serverPlayer) {
-            int mode = stack.getOrCreateTag().getInt("umode");
+            int mode = AE2Addon.cellTag(stack).getInt("umode");
             if (mode < 1 || mode > 3) mode = 1;
 
             if (mode == MODE_CUSTOM) {
-                NetworkHooks.openScreen(serverPlayer, new MenuProvider() {
+                // NeoForge 1.21：原版 Player.openMenu 直接支持附加数据写入
+                serverPlayer.openMenu(new MenuProvider() {
                     @Override public Component getDisplayName() {
                         return Component.translatable("gui.ae2addon.mode2_config");
                     }
@@ -62,17 +63,18 @@ public class UniversalStorageCell extends Item implements ICellWorkbenchItem {
                 }, buf -> {
                     // 只传阈值，裁掉 s2/ul/wl 等重 NBT 数据以防止打开菜单时就炸包
                     ItemStack copy = stack.copy();
-                    CompoundTag tag = copy.getOrCreateTag();
+                    CompoundTag tag = AE2Addon.cellTag(copy);
                     tag.remove("s1");
                     tag.remove("s2");
                     tag.remove("sa");
                     tag.remove("u");
                     tag.remove("w");
-                    buf.writeItem(copy);
+                    AE2Addon.setCellTag(copy, tag);
+                    ItemStack.OPTIONAL_STREAM_CODEC.encode(buf, copy);
                 });
             } else {
                 // Mode 1 / Mode 3：只传光副本，裁掉存储NBT防炸包
-                NetworkHooks.openScreen(serverPlayer, new MenuProvider() {
+                serverPlayer.openMenu(new MenuProvider() {
                     @Override public Component getDisplayName() {
                         return Component.translatable("gui.ae2addon.mode_select");
                     }
@@ -81,14 +83,15 @@ public class UniversalStorageCell extends Item implements ICellWorkbenchItem {
                     }
                 }, buf -> {
                     ItemStack copy = stack.copy();
-                    CompoundTag tag = copy.getOrCreateTag();
+                    CompoundTag tag = AE2Addon.cellTag(copy);
                     tag.remove("s1");
                     tag.remove("s2");
                     tag.remove("sa");
                     tag.remove("u");
                     tag.remove("w");
                     tag.remove("a");
-                    buf.writeItem(copy);
+                    AE2Addon.setCellTag(copy, tag);
+                    ItemStack.OPTIONAL_STREAM_CODEC.encode(buf, copy);
                 });
             }
         }
@@ -99,7 +102,7 @@ public class UniversalStorageCell extends Item implements ICellWorkbenchItem {
 
     @Override public boolean isEditable(ItemStack cellItem) { return true; }
     @Override public ConfigInventory getConfigInventory(ItemStack is) {
-        return ConfigInventory.configTypes(63, () -> {});
+        return ConfigInventory.configTypes(63).build();
     }
     @Override public IUpgradeInventory getUpgrades(ItemStack cellItem) {
         return UpgradeInventories.forItem(cellItem, 1, (s, u) -> {});
@@ -111,16 +114,16 @@ public class UniversalStorageCell extends Item implements ICellWorkbenchItem {
 
     @Override
     public Component getName(ItemStack stack) {
-        int m = stack.getOrCreateTag().getInt("umode");
+        int m = AE2Addon.cellTag(stack).getInt("umode");
         String[] n = {"", "§a无限制", "§e自定义", "§d全类型"};
         if (m < 1 || m > 3) m = 1;
         return Component.literal("§5万能无限 [" + n[m] + "]");
     }
 
     @Override
-    public void appendHoverText(ItemStack stack, @Nullable Level level,
+    public void appendHoverText(ItemStack stack, net.minecraft.world.item.Item.TooltipContext context,
                                 List<Component> tooltip, TooltipFlag flag) {
-        CompoundTag tag = stack.getOrCreateTag();
+        CompoundTag tag = AE2Addon.cellTag(stack);
         int m = tag.getInt("umode");
         if (m < 1 || m > 3) m = 1;
 

@@ -19,10 +19,10 @@ import org.spongepowered.asm.mixin.Shadow;
 public abstract class TooltipsMixin {
 
     @Shadow
-    private static String[] units;
+    public static String[] units;
 
     @Shadow
-    private static String getAmount(double value, long divisor) {
+    public static String getAmount(double value, long divisor) {
         throw new AssertionError("Shadow method not implemented");
     }
 

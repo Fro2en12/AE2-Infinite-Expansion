@@ -8,6 +8,7 @@ import mezz.jei.api.ingredients.ITypedIngredient;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.Rect2i;
 import net.minecraft.world.item.ItemStack;
+import net.neoforged.neoforge.network.PacketDistributor;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -83,7 +84,7 @@ public class Mode2ConfigGhostHandler implements IGhostIngredientHandler<Mode2Con
             // 直接将 JEI 拖拽的物品作为白名单添加请求发到服务端
             ItemStack toAdd = stack.copy();
             toAdd.setCount(1);
-            AE2Addon.NETWORK.sendToServer(new Mode2ConfigPacket(toAdd));
+            PacketDistributor.sendToServer(new Mode2ConfigPacket(toAdd));
         }
     }
 }
