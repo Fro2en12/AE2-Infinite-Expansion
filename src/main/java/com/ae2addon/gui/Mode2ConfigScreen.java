@@ -347,7 +347,9 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
 
     @Override
     protected void renderBg(GuiGraphics g, float d, int mx, int my) {
-        renderBackground(g, mx, my, d);
+        // 注意：1.21.1 的 renderBackground(gui, x, y, partialTick) 内部会回调 renderBg，
+        // 在这里再调用会造成 renderBg → renderBackground → renderBg 无限递归（StackOverflowError）。
+        // 背景由 AbstractContainerScreen.render → renderBackground 统一绘制，此处留空。
     }
 
     @Override
