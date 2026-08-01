@@ -191,10 +191,13 @@ public class UnlimitedCellInventory implements StorageCell {
             }
         } else if (mode == 2) {
             if (workMode == 1) {
-                for (BigInteger v : s2.values()) {
-                    bytes += v.min(BigInteger.valueOf(Long.MAX_VALUE - bytes)).longValue();
-                    if (bytes < 0) bytes = Long.MAX_VALUE;
-                    types++;
+                for (Map.Entry<AEKey, BigInteger> e : s2.entrySet()) {
+                    if (!wl.contains(e.getKey()) && !ul.contains(e.getKey())) {
+                        BigInteger v = e.getValue();
+                        bytes += v.min(BigInteger.valueOf(Long.MAX_VALUE - bytes)).longValue();
+                        if (bytes < 0) bytes = Long.MAX_VALUE;
+                        types++;
+                    }
                 }
                 infiniteCount = ul.size();
                 types += infiniteCount;
@@ -254,6 +257,12 @@ public class UnlimitedCellInventory implements StorageCell {
             return amount;
         }
         if (mode == 2 && workMode == 3 && (wl.contains(what) || ul.contains(what))) {
+            return amount;
+        }
+        if (mode == 2 && workMode == 1 && (wl.contains(what) || ul.contains(what))) {
+            // 已在无限集合中的物品放回：保持无限，不进入有限存储 s2。
+            // 否则 s2 会残留少量数量，getAvailableStacks 中后写的 s2 条目会覆盖
+            // ul 的 INFINITE 显示，导致"取出后放回无限状态丢失"。
             return amount;
         }
 
@@ -399,7 +408,9 @@ public class UnlimitedCellInventory implements StorageCell {
 
             if (workMode == 1) {
                 for (Map.Entry<AEKey, BigInteger> e : s2.entrySet()) {
-                    out.add(e.getKey(), clampToLong(e.getValue()));
+                    if (!wl.contains(e.getKey()) && !ul.contains(e.getKey())) {
+                        out.add(e.getKey(), clampToLong(e.getValue()));
+                    }
                 }
             }
             return;
