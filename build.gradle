@@ -56,11 +56,6 @@ repositories {
     mavenCentral()
 }
 
-configurations {
-    embed
-    implementation.extendsFrom(embed)
-}
-
 dependencies {
     implementation "net.neoforged:neoforge:21.1.247"
 
@@ -68,8 +63,10 @@ dependencies {
     compileOnly "org.spongepowered:mixin:0.8.7"
     annotationProcessor "org.spongepowered:mixin:0.8.7:processor"
 
-    // 拼音搜索支持 — 嵌入到mod jar中
-    embed 'com.belerweb:pinyin4j:2.5.1'
+    // 拼音搜索支持 — 用 ModDevGradle 的 jarJar 机制打包进 mod jar（META-INF/jarjar/），
+    // 开发运行（runClient/runServer）与发布版均可通过 jar-in-jar 自动加载
+    implementation 'com.belerweb:pinyin4j:2.5.1'
+    jarJar 'com.belerweb:pinyin4j:2.5.1'
 
     // AE2 19.2.17 for NeoForge 1.21.1 — 通过 Modrinth Maven 获取
     implementation "maven.modrinth:ae2:19.2.17"
@@ -85,10 +82,6 @@ dependencies {
 }
 
 jar {
-    from {
-        configurations.embed.collect { it.isDirectory() ? it : zipTree(it) }
-    }
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     manifest {
         attributes([
                 "Specification-Title"     : "AE2 Addon — Infinite Expansion",
@@ -104,4 +97,23 @@ jar {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+}
+
+// ModDevGradle 2.x 的 dev 运行以 sourceSet 目录提供 mod，不会自动解出 jarJar 库，
+// 导致 runClient/runServer 中 pinyin4j 等库 NoClassDefFoundError（发布 jar 不受影响）。
+// 这里在 legacyClasspath 生成后追加 jarJar 库，仅供开发运行使用。
+tasks.named('writeClientLegacyClasspath').configure {
+    doLast {
+        def cpFile = layout.buildDirectory.file('moddev/clientLegacyClasspath.txt').get().asFile
+        if (cpFile.exists()) {
+            def existing = cpFile.text
+            configurations.jarJar.each { jarFile ->
+                def line = jarFile.absolutePath
+                if (!existing.contains(line)) {
+                    cpFile.append(System.lineSeparator() + line)
+                    existing = cpFile.text
+                }
+            }
+        }
+    }
 }
