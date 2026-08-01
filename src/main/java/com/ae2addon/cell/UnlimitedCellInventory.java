@@ -9,17 +9,13 @@ import appeng.api.storage.cells.StorageCell;
 import com.ae2addon.AE2Addon;
 import com.ae2addon.data.CellDataSavedData;
 import net.minecraft.core.HolderLookup;
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.level.material.Fluid;
-import net.minecraft.world.level.material.Fluids;
 import net.neoforged.neoforge.server.ServerLifecycleHooks;
 
 import java.math.BigInteger;
@@ -38,6 +34,16 @@ public class UnlimitedCellInventory implements StorageCell {
     public static final long INFINITE = Long.MAX_VALUE; // 9223372036854775807
     public static final long INFINITE_BYTES = 300000000; // 无限类型在面板中显示的字节数
 
+    /**
+     * 报告给 AE2 网络的"无限"显示值。
+     * <p>
+     * 不能直接用 {@link #INFINITE}（Long.MAX_VALUE）：网络汇总多个存储的同类型数量时
+     * 会累加溢出为负数，导致 AE2WTLib 补货悬浮层调用 ReadableNumberConverter.format(负数)
+     * 直接崩溃。此值约 1.15e18，8 个同类型条目累加才到 Long.MAX_VALUE，远低于实际会溢出的场景；
+     * 提取时仍返回真无限 {@link #INFINITE}，功能不受影响。
+     */
+    public static final long DISPLAY_INFINITE = Long.MAX_VALUE / 8;
+
     private final ItemStack cellItem;
     private final ISaveProvider saveProvider;
     private UUID uuid;
@@ -52,9 +58,6 @@ public class UnlimitedCellInventory implements StorageCell {
     /** 承诺额度：升级为无限时的记录数（用 long 够用） */
     private Map<AEKey, Long> ca = new HashMap<>();
     private Set<AEKey> m3 = new HashSet<>();
-
-    private static List<AEKey> ALL_KEYS_CACHE = null;
-    private static boolean ALL_KEYS_INIT = false;
 
     private boolean dataDirty = false;
 
@@ -335,58 +338,11 @@ public class UnlimitedCellInventory implements StorageCell {
         return extractFromMap((mode == 1) ? s1 : s2, what, amount, act);
     }
 
-    private static void ensureAllKeysCache() {
-        // 缓存为空时允许重新初始化（防止首次遍历中断导致全类型显示缺失）
-        if (ALL_KEYS_INIT && ALL_KEYS_CACHE != null && !ALL_KEYS_CACHE.isEmpty()) {
-            return;
-        }
-        ALL_KEYS_INIT = true;
-        try {
-            List<AEKey> list = new ArrayList<>();
-
-            Iterator<Item> itemIt = BuiltInRegistries.ITEM.iterator();
-            while (itemIt.hasNext()) {
-                Item item = itemIt.next();
-                try {
-                    AEItemKey k = AEItemKey.of(item);
-                    if (k != null) {
-                        list.add(k);
-                    }
-                } catch (Throwable e) {
-                    // 整合包 mod 众多，个别物品可能触发 Error（如 NoClassDefFoundError），
-                    // 必须捕获 Throwable 避免中断整个遍历
-                }
-            }
-
-            Iterator<Fluid> fluidIt = BuiltInRegistries.FLUID.iterator();
-            while (fluidIt.hasNext()) {
-                Fluid fluid = fluidIt.next();
-                try {
-                    if (fluid != Fluids.EMPTY) {
-                        AEFluidKey k = AEFluidKey.of(fluid);
-                        if (k != null) {
-                            list.add(k);
-                        }
-                    }
-                } catch (Throwable e) {
-                    // skip
-                }
-            }
-
-            ALL_KEYS_CACHE = list;
-        } catch (Throwable t) {
-            ALL_KEYS_CACHE = new ArrayList<>();
-        }
-    }
-
     public void getAvailableStacks(KeyCounter out) {
         if (mode == 3) {
-            ensureAllKeysCache();
-            for (AEKey k : ALL_KEYS_CACHE) {
-                out.add(k, INFINITE);
-            }
+            // 只报告实际放入过的类型（m3）：任意类型放入即无限，终端显示已放入的类型。
             for (AEKey k : m3) {
-                out.add(k, INFINITE);
+                out.add(k, DISPLAY_INFINITE);
             }
             return;
         }
@@ -394,11 +350,11 @@ public class UnlimitedCellInventory implements StorageCell {
         if (mode == 2) {
             if (workMode == 3) {
                 for (AEKey k : wl) {
-                    out.add(k, INFINITE);
+                    out.add(k, DISPLAY_INFINITE);
                 }
                 for (AEKey k : ul) {
                     if (!wl.contains(k)) {
-                        out.add(k, INFINITE);
+                        out.add(k, DISPLAY_INFINITE);
                     }
                 }
                 for (Map.Entry<AEKey, BigInteger> e : s2.entrySet()) {
@@ -410,11 +366,11 @@ public class UnlimitedCellInventory implements StorageCell {
             }
 
             for (AEKey k : wl) {
-                out.add(k, INFINITE);
+                out.add(k, DISPLAY_INFINITE);
             }
             for (AEKey k : ul) {
                 if (!wl.contains(k)) {
-                    out.add(k, INFINITE);
+                    out.add(k, DISPLAY_INFINITE);
                 }
             }
 

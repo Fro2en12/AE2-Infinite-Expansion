@@ -56,5 +56,5 @@ description='''
     ordering="NONE"
     side="BOTH"
 
-[[mixin]]
+[[mixins]]
 config="ae2addon.mixins.json"

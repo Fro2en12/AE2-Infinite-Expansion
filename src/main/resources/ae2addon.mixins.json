@@ -8,6 +8,9 @@
     "GridMixin",
     "TooltipsMixin"
   ],
-  "client": [],
+  "client": [
+    "AEKeyTypeFormatAmountMixin",
+    "ReadableNumberConverterMixin"
+  ],
   "server": []
 }
