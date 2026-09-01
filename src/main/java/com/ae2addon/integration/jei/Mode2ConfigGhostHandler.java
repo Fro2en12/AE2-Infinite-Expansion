@@ -1,6 +1,5 @@
 package com.ae2addon.integration.jei;
 
-import com.ae2addon.AE2Addon;
 import com.ae2addon.gui.Mode2ConfigScreen;
 import com.ae2addon.network.Mode2ConfigPacket;
 import mezz.jei.api.gui.handlers.IGhostIngredientHandler;
@@ -8,6 +7,8 @@ import mezz.jei.api.ingredients.ITypedIngredient;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.Rect2i;
 import net.minecraft.world.item.ItemStack;
+import net.neoforged.fml.ModList;
+import net.neoforged.neoforge.fluids.FluidStack;
 import net.neoforged.neoforge.network.PacketDistributor;
 
 import java.util.ArrayList;
@@ -16,8 +17,8 @@ import java.util.List;
 /**
  * Mode 2 配置界面的 Ghost Ingredient 处理器
  * <p>
- * 允许玩家从 JEI 面板直接拖拽物品到背包槽位，
- * 从而快速将物品加入白名单。
+ * 允许玩家从 JEI 面板直接拖拽物品/流体/Mekanism 化学物到背包槽位，
+ * 从而快速将对应 AEKey 加入白名单。
  */
 public class Mode2ConfigGhostHandler implements IGhostIngredientHandler<Mode2ConfigScreen> {
 
@@ -26,7 +27,10 @@ public class Mode2ConfigGhostHandler implements IGhostIngredientHandler<Mode2Con
         List<Target<I>> targets = new ArrayList<>();
 
         I ing = ingredient.getIngredient();
-        if (!(ing instanceof ItemStack)) {
+        // 物品 / 流体 / Mekanism 化学物（气体等；未装 Mekanism 时短路不命中）
+        if (!(ing instanceof ItemStack) && !(ing instanceof FluidStack)
+                && !(ModList.get().isLoaded("mekanism")
+                        && ing instanceof mekanism.api.chemical.ChemicalStack)) {
             return targets;
         }
 
@@ -60,7 +64,7 @@ public class Mode2ConfigGhostHandler implements IGhostIngredientHandler<Mode2Con
     }
 
     /**
-     * 拖拽目标：将 JEI 中的 ItemStack 作为白名单加入请求发送到服务端
+     * 拖拽目标：将 JEI 中的 ItemStack / FluidStack / ChemicalStack 加入白名单请求发送到服务端
      */
     private static class AddToWhitelistTarget<I> implements Target<I> {
         private final Rect2i area;
@@ -76,15 +80,26 @@ public class Mode2ConfigGhostHandler implements IGhostIngredientHandler<Mode2Con
 
         @Override
         public void accept(I ingredient) {
-            if (!(ingredient instanceof ItemStack stack)) return;
-
             Minecraft mc = Minecraft.getInstance();
             if (mc.player == null) return;
 
-            // 直接将 JEI 拖拽的物品作为白名单添加请求发到服务端
-            ItemStack toAdd = stack.copy();
-            toAdd.setCount(1);
-            PacketDistributor.sendToServer(new Mode2ConfigPacket(toAdd));
+            if (ingredient instanceof ItemStack stack) {
+                // 物品：原逻辑（服务端自动检测流体容器）
+                ItemStack toAdd = stack.copy();
+                toAdd.setCount(1);
+                PacketDistributor.sendToServer(new Mode2ConfigPacket(toAdd));
+            } else if (ingredient instanceof FluidStack fluid) {
+                // 流体：AEKey 直加白名单
+                PacketDistributor.sendToServer(new Mode2ConfigPacket(
+                        appeng.api.stacks.AEFluidKey.of(fluid)));
+            } else if (ModList.get().isLoaded("mekanism")
+                    && ingredient instanceof mekanism.api.chemical.ChemicalStack chemical) {
+                // 化学物（气体等）：AEKey 直加白名单
+                var key = com.ae2addon.compat.MekanismGasCompat.keyOfChemical(chemical);
+                if (key != null) {
+                    PacketDistributor.sendToServer(new Mode2ConfigPacket(key));
+                }
+            }
         }
     }
 }

@@ -2,21 +2,29 @@ package com.ae2addon.gui;
 
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.AEKeyType;
-import com.ae2addon.AE2Addon;
+import appeng.api.stacks.AEItemKey;
+import appeng.api.stacks.AEFluidKey;
 import com.ae2addon.cell.UnlimitedCellInventory;
 import com.ae2addon.network.Mode2ConfigPacket;
 import com.ae2addon.network.SetCellModePacket;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
+import net.minecraft.client.resources.language.I18n;
+import net.minecraft.tags.TagKey;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.Item;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.TooltipFlag;
+import net.minecraft.world.level.material.Fluid;
+import net.minecraft.world.level.material.Fluids;
 import net.neoforged.neoforge.network.PacketDistributor;
 
 import net.sourceforge.pinyin4j.PinyinHelper;
@@ -54,6 +62,7 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
 
     private EditBox thresholdInput;
     private EditBox searchBox;
+    private EditBox ruleInput;
     private List<UnlimitedCellInventory.PanelItem> displayItems = new ArrayList<>();
     /** 搜索+分类过滤后的条目 */
     private List<UnlimitedCellInventory.PanelItem> filteredItems = new ArrayList<>();
@@ -61,13 +70,30 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
     private List<ResourceLocation> availableTypes = new ArrayList<>();
     /** 当前选中的 type ID，null=全部 */
     private ResourceLocation currentTypeFilter = null;
+    /** 当前选中的规则分类（"tag:xxx" / "mod:xxx"），null=全部 */
+    private String currentRuleFilter = null;
+    /** 规则分类模式下的物品列表（客户端遍历注册表生成） */
+    private List<UnlimitedCellInventory.PanelItem> ruleItems = new ArrayList<>();
     private int scrollOffset = 0;
+    /** 分类标签行横向滚动偏移（px） */
+    private int tabScrollOffset = 0;
+    /** 批量无限规则条横向滚动偏移（px） */
+    private int ruleBarScrollOffset = 0;
+    /** 拖拽中的滑条：0=无 1=主列表 2=规则条 3=标签 */
+    private int draggingScrollbar = 0;
     private int maxVisibleRows;
     private String lastSearch = "";
     private int currentWorkMode = 1;
     /** 0=工作模式选择, 1=具体配置 */
     private int uiState = 0;
     private Button thresholdSaveBtn;
+    /** 规则输入框当前类型：true=tag, false=mod */
+    private boolean ruleIsTag = true;
+    /** 客户端缓存的规则列表 */
+    private List<String> tagRules = new ArrayList<>();
+    private List<String> modRules = new ArrayList<>();
+    /** 规则生效模式：true=立即全量，false=触碰后 */
+    private boolean ruleInstant = true;
 
     /** 拼音缓存：原始名称 → [全拼, 首字母] */
     private final Map<String, String[]> pinyinCache = new HashMap<>();
@@ -123,7 +149,9 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
     /** 工作模式选择界面（3个按钮 + 返回） */
     private void buildWorkModeSelectUI() {
         int cx = leftPos + W / 2;
-        String[] names = {"阈值模式", "存入无限", "臻藏模式"};
+        String[] names = {I18n.get("gui.ae2addon.mode2.wm.threshold"),
+                I18n.get("gui.ae2addon.mode2.wm.deposit"),
+                I18n.get("gui.ae2addon.mode2.wm.cherish")};
         for (int i = 0; i < 3; i++) {
             int wm = i + 1;
             boolean active = wm == currentWorkMode;
@@ -137,7 +165,7 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         }
         // 返回
         addRenderableWidget(Button.builder(
-                Component.literal("§7← 返回"),
+                Component.translatable("gui.ae2addon.mode2.back"),
                 b -> {
                     PacketDistributor.sendToServer(new SetCellModePacket(0));
                     onClose();
@@ -155,7 +183,7 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         addRenderableWidget(thresholdInput);
 
         thresholdSaveBtn = Button.builder(
-                Component.literal("§a保存"),
+                Component.translatable("gui.ae2addon.mode2.save"),
                 btn -> saveThreshold()
         ).bounds(leftPos + 114, topPos + 18, 50, 18).build();
         thresholdSaveBtn.visible = (currentWorkMode == 1);
@@ -168,21 +196,128 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         ).bounds(leftPos + 168, topPos + 18, 22, 18).build());
 
         // ── 切换工作模式（阈值→存入∞→臻藏→循环） ──
-        String[] wmLabels = {"", "§e⇄ 存入∞", "§e⇄ 臻藏", "§e⇄ 阈值"};
+        String[] wmLabels = {"", I18n.get("gui.ae2addon.mode2.btn_deposit"),
+                I18n.get("gui.ae2addon.mode2.btn_cherish"),
+                I18n.get("gui.ae2addon.mode2.btn_threshold")};
         addRenderableWidget(Button.builder(
                 Component.literal(wmLabels[currentWorkMode]),
                 btn -> cycleWorkMode()
         ).bounds(leftPos + 194, topPos + 18, 52, 18).build());
 
+        // ── 批量无限规则（tags / mods）：标题正右侧 ──
+        int titleW = font.width(I18n.get("gui.ae2addon.mode2.title"));
+        int ruleX = leftPos + 10 + titleW + 6;
+        int ruleY = topPos + 4;
+        // 生效模式按钮贴右边缘，输入条占用其余空间（动态分配）
+        int modeBtnX = leftPos + W - 56;
+        int avail = modeBtnX - ruleX - 4;
+        int tagBtnW = 26;
+        int addBtnW = 16;
+        int inputW = Math.max(20, avail - tagBtnW - addBtnW - 6);
+
+        ruleInput = new EditBox(font, ruleX, ruleY, inputW, 14, Component.literal("Rule"));
+        ruleInput.setMaxLength(64);
+        ruleInput.setHint(Component.literal(ruleIsTag ? "§7tag" : "§7mod"));
+        addRenderableWidget(ruleInput);
+
+        // tag/mod 切换
+        addRenderableWidget(Button.builder(
+                Component.literal(ruleIsTag ? "§bTag" : "§dMod"),
+                btn -> {
+                    ruleIsTag = !ruleIsTag;
+                    ruleInput.setHint(Component.literal(ruleIsTag ? "§7tag" : "§7mod"));
+                    rebuildWidgets();
+                }
+        ).bounds(ruleX + inputW + 2, ruleY - 1, tagBtnW, 16).build());
+
+        // 添加规则
+        addRenderableWidget(Button.builder(
+                Component.literal("§a＋"),
+                btn -> addRule()
+        ).bounds(ruleX + inputW + tagBtnW + 4, ruleY - 1, addBtnW, 16).build());
+
+        // 生效模式切换（立即全量 / 触碰后）—— 贴右边缘
+        addRenderableWidget(Button.builder(
+                Component.translatable(ruleInstant ? "gui.ae2addon.mode2.instant" : "gui.ae2addon.mode2.touch"),
+                btn -> {
+                    ruleInstant = !ruleInstant;
+                    menu.sendSetRuleInstant(ruleInstant);
+                    rebuildWidgets();
+                }
+        ).bounds(modeBtnX, ruleY - 1, 54, 16).build());
+
         // ── 搜索框 ──
         searchBox = new EditBox(font, leftPos + PANEL_X, topPos + PANEL_Y - 24, PANEL_W - 50, 14,
                 Component.literal("Search"));
         searchBox.setMaxLength(40);
-        searchBox.setHint(Component.literal("§7搜索"));
+        searchBox.setHint(Component.translatable("gui.ae2addon.mode2.search"));
         addRenderableWidget(searchBox);
 
         maxVisibleRows = PANEL_H / ROW_H;
         requestRefresh();
+    }
+
+    /** 添加 tag/mod 规则 */
+    private void addRule() {
+        String v = ruleInput.getValue().trim();
+        if (v.isEmpty()) return;
+        if (ruleIsTag) {
+            menu.sendAddTagRule(v);
+        } else {
+            menu.sendAddModRule(v);
+        }
+        ruleInput.setValue("");
+        // 稍等服务端返回后刷新规则列表
+    }
+
+    /** 服务端规则数据响应（type 9，主线程） */
+    public static void handleRuleData(boolean isTag, List<String> rules, boolean ruleInstant) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.screen instanceof Mode2ConfigScreen screen) {
+            screen.menu.setRuleData(isTag, rules);
+            if (isTag) {
+                screen.tagRules = new ArrayList<>(rules);
+            } else {
+                screen.modRules = new ArrayList<>(rules);
+            }
+            screen.ruleInstant = ruleInstant;
+        }
+    }
+
+    // ── 黑名单分包接收（type 12） ──
+
+    private static final Map<Integer, List<AEKey>> PENDING_BLACKLIST_CHUNKS = new HashMap<>();
+    private static int PENDING_BLACKLIST_TOTAL = 0;
+
+    public static void handleBlacklistChunk(List<AEKey> keys, int chunkIndex, int totalChunks) {
+        if (chunkIndex == 0) {
+            PENDING_BLACKLIST_CHUNKS.clear();
+            PENDING_BLACKLIST_TOTAL = totalChunks;
+        }
+        if (totalChunks != PENDING_BLACKLIST_TOTAL) {
+            return;
+        }
+        PENDING_BLACKLIST_CHUNKS.put(chunkIndex, keys == null ? new ArrayList<>() : keys);
+
+        if (PENDING_BLACKLIST_CHUNKS.size() >= PENDING_BLACKLIST_TOTAL) {
+            List<AEKey> merged = new ArrayList<>();
+            for (int i = 0; i < PENDING_BLACKLIST_TOTAL; i++) {
+                List<AEKey> chunk = PENDING_BLACKLIST_CHUNKS.get(i);
+                if (chunk == null) return;
+                merged.addAll(chunk);
+            }
+            Minecraft mc = Minecraft.getInstance();
+            if (mc.screen instanceof Mode2ConfigScreen screen) {
+                screen.menu.setBlacklist(merged);
+                if (screen.currentRuleFilter != null) {
+                    // 规则分类模式下重新生成（黑名单状态变化）
+                    screen.ruleItems = screen.buildRuleItems(screen.currentRuleFilter);
+                    screen.applyFilters();
+                }
+            }
+            PENDING_BLACKLIST_CHUNKS.clear();
+            PENDING_BLACKLIST_TOTAL = 0;
+        }
     }
 
     private void cycleWorkMode() {
@@ -213,11 +348,95 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         }
     }
 
+    // ── 规则分类（客户端遍历注册表） ──
+
+    /** 客户端判断 key 是否命中指定规则（"tag:xxx" / "mod:xxx"） */
+    private boolean clientMatchesRule(AEKey key, String rule) {
+        if (rule == null || !rule.contains(":")) return false;
+        String kind = rule.substring(0, rule.indexOf(':'));
+        String value = rule.substring(rule.indexOf(':') + 1);
+
+        if (key instanceof AEItemKey itemKey) {
+            Item item = itemKey.getItem();
+            ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
+            if (kind.equals("mod")) {
+                return id.getNamespace().equals(value);
+            }
+            if (kind.equals("tag")) {
+                ResourceLocation tagId = ResourceLocation.tryParse(value);
+                if (tagId == null) return false;
+                TagKey<Item> tagKey = TagKey.create(Registries.ITEM, tagId);
+                return item.builtInRegistryHolder().is(tagKey);
+            }
+        } else if (key instanceof AEFluidKey fluidKey) {
+            ResourceLocation id = BuiltInRegistries.FLUID.getKey(fluidKey.getFluid());
+            if (kind.equals("mod")) {
+                return id.getNamespace().equals(value);
+            }
+            if (kind.equals("tag")) {
+                ResourceLocation tagId = ResourceLocation.tryParse(value);
+                if (tagId == null) return false;
+                TagKey<Fluid> tagKey = TagKey.create(Registries.FLUID, tagId);
+                return fluidKey.getFluid().builtInRegistryHolder().is(tagKey);
+            }
+        }
+        return false;
+    }
+
+    /** 生成某规则分类下的全部物品（遍历注册表；黑名单物品标为非无限） */
+    private List<UnlimitedCellInventory.PanelItem> buildRuleItems(String rule) {
+        List<UnlimitedCellInventory.PanelItem> items = new ArrayList<>();
+        Set<AEKey> bl = new HashSet<>(menu.getBlacklist());
+        // 物品
+        Iterator<Item> itemIt = BuiltInRegistries.ITEM.iterator();
+        while (itemIt.hasNext()) {
+            Item item = itemIt.next();
+            try {
+                AEItemKey k = AEItemKey.of(item);
+                if (k != null && clientMatchesRule(k, rule)) {
+                    boolean blocked = bl.contains(k);
+                    items.add(new UnlimitedCellInventory.PanelItem(k, blocked ? 0 : UnlimitedCellInventory.INFINITE, !blocked));
+                }
+            } catch (Exception ignored) {}
+        }
+        // 流体
+        Iterator<Fluid> fluidIt = BuiltInRegistries.FLUID.iterator();
+        while (fluidIt.hasNext()) {
+            Fluid fluid = fluidIt.next();
+            try {
+                if (fluid == Fluids.EMPTY) continue;
+                AEFluidKey k = AEFluidKey.of(fluid);
+                if (k != null && clientMatchesRule(k, rule)) {
+                    boolean blocked = bl.contains(k);
+                    items.add(new UnlimitedCellInventory.PanelItem(k, blocked ? 0 : UnlimitedCellInventory.INFINITE, !blocked));
+                }
+            } catch (Exception ignored) {}
+        }
+        return items;
+    }
+
+    /** 切换到规则分类（"tag:xxx" / "mod:xxx"）或返回全部 */
+    private void selectRuleFilter(String rule) {
+        if (rule == null) {
+            currentRuleFilter = null;
+            ruleItems.clear();
+        } else {
+            currentRuleFilter = rule;
+            ruleItems = buildRuleItems(rule);
+        }
+        currentTypeFilter = null;
+        scrollOffset = 0;
+        applyFilters();
+    }
+
     private void applyFilters() {
         String search = searchBox.getValue().toLowerCase(Locale.ROOT).trim();
         filteredItems.clear();
 
-        for (var item : displayItems) {
+        // 规则分类模式：数据源是客户端遍历生成的 ruleItems
+        List<UnlimitedCellInventory.PanelItem> source = (currentRuleFilter != null) ? ruleItems : displayItems;
+
+        for (var item : source) {
             // 分类过滤
             if (currentTypeFilter != null) {
                 ResourceLocation typeId = item.key.getType().getId();
@@ -264,7 +483,7 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         StringBuilder initials = new StringBuilder();
 
         for (char c : chinese.toCharArray()) {
-            if (c >= '\u4e00' && c <= '\u9fff') {
+            if (c >= '一' && c <= '鿿') {
                 try {
                     String[] pinyins = PinyinHelper.toHanyuPinyinStringArray(c, PINYIN_FORMAT);
                     if (pinyins != null && pinyins.length > 0) {
@@ -358,9 +577,13 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         super.render(g, mx, my, d); // slots isActive=false 时不渲染
 
         if (uiState == 0) {
-            g.drawString(font, "§l✦ 选择工作模式", leftPos + W / 2 - 36, topPos + 4, 0xFFFFAA, false);
-            String[] curLabels = {"", "§e▶ 当前：阈值模式", "§d▶ 当前：存入无限", "§5▶ 当前：臻藏模式"};
-            String[] curDescs = {"", "§7说明：物品达阈值后自动解锁无限", "§7说明：存入的任意物品会直接变为无限", "§7说明：只有白名单内的物品才能无限"};
+            g.drawString(font, I18n.get("gui.ae2addon.mode2.select_title"), leftPos + W / 2 - 36, topPos + 4, 0xFFFFAA, false);
+            String[] curLabels = {"", I18n.get("gui.ae2addon.mode2.wm.cur_threshold"),
+                    I18n.get("gui.ae2addon.mode2.wm.cur_deposit"),
+                    I18n.get("gui.ae2addon.mode2.wm.cur_cherish")};
+            String[] curDescs = {"", I18n.get("gui.ae2addon.mode2.wm.desc_threshold"),
+                    I18n.get("gui.ae2addon.mode2.wm.desc_deposit"),
+                    I18n.get("gui.ae2addon.mode2.wm.desc_cherish")};
             if (currentWorkMode >= 1 && currentWorkMode <= 3) {
                 g.drawString(font, Component.literal(curLabels[currentWorkMode]), leftPos + 10, topPos + 125, 0xFFFFAA, false);
                 g.drawString(font, Component.literal(curDescs[currentWorkMode]), leftPos + 10, topPos + 138, 0x888888, false);
@@ -370,12 +593,79 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         }
 
         // 完整配置界面
-        g.drawString(font, "§e✦ 自定义无限配置", leftPos + 10, topPos + 4, 0xFFFFAA, false);
+        g.drawString(font, I18n.get("gui.ae2addon.mode2.title"), leftPos + 10, topPos + 4, 0xFFFFAA, false);
+        renderRuleBar(g, mx, my);
         renderPanel(g, mx, my);
         renderFilterTabs(g, mx, my);
-        g.drawString(font, "§7Shift+点击切换  |  背包物品添加白名单  |  滚轮滚动", leftPos + 10, topPos + PANEL_Y + PANEL_H + 8, 0x888888, false);
+        g.drawString(font, I18n.get("gui.ae2addon.mode2.hint_bar"), leftPos + 10, topPos + PANEL_Y + PANEL_H + 8, 0x888888, false);
         renderTooltip(g, mx, my);
         renderPanelTooltip(g, mx, my);
+    }
+
+    /** 渲染批量无限规则条（tags/mods），点击可删除；横向可滚动 */
+    private void renderRuleBar(GuiGraphics g, int mx, int my) {
+        int x = leftPos + 10;
+        int y = topPos + 62;
+        int viewW = PANEL_W - 14; // 右侧留滚动条空间
+        String modeStr = ruleInstant ? I18n.get("gui.ae2addon.mode2.instant_short") : I18n.get("gui.ae2addon.mode2.touch_short");
+        String header = I18n.get("gui.ae2addon.mode2.batch_header", modeStr);
+        int headerW = font.width(header) + 4;
+        g.drawString(font, Component.literal(header), x, y, 0xFFFFAA, false);
+
+        // 收集词条（加大间距 18px）
+        List<Object[]> chips = new ArrayList<>(); // [label, kind, key]
+        for (String tag : tagRules) {
+            chips.add(new Object[]{"[tag:" + tag + "]", 2, tag});
+        }
+        for (String mod : modRules) {
+            chips.add(new Object[]{"[mod:" + mod + "]", 3, mod});
+        }
+
+        if (chips.isEmpty()) {
+            g.drawString(font, I18n.get("gui.ae2addon.mode2.no_rules"), x + headerW + 4, y, 0x888888, false);
+            return;
+        }
+
+        // 总宽（词条间距 18）
+        int totalW = 0;
+        for (Object[] c : chips) {
+            totalW += font.width((String) c[0]) + 18;
+        }
+        int maxScroll = Math.max(0, totalW - viewW);
+        if (ruleBarScrollOffset > maxScroll) ruleBarScrollOffset = maxScroll;
+        if (ruleBarScrollOffset < 0) ruleBarScrollOffset = 0;
+
+        // 绘制词条（裁剪）
+        int cx = x + headerW - ruleBarScrollOffset;
+        for (Object[] c : chips) {
+            String label = (String) c[0];
+            int kind = (Integer) c[1];
+            int w = font.width(label) + 18;
+            if (cx + w < x + headerW || cx > x + headerW + viewW) {
+                cx += w;
+                continue;
+            }
+            boolean hover = mx >= cx && mx < cx + w && my >= y && my < y + 10;
+            String color;
+            if (kind == 2) {
+                color = hover ? "§c" : "§b";
+            } else {
+                color = hover ? "§c" : "§d";
+            }
+            g.drawString(font, Component.literal(color + label), cx, y, 0xFFFFFF, false);
+            cx += w;
+        }
+
+        // 底部横向滚动条（内容超宽时显示）
+        if (totalW > viewW) {
+            int barX = x + headerW;
+            int barY = y + 11;
+            int barW = viewW - 8;
+            int sliderW = Math.max(12, (int) (barW * (double) viewW / totalW));
+            int sliderX = barX + (int) ((barW - sliderW) * ((double) ruleBarScrollOffset / maxScroll));
+            g.fill(barX, barY, barX + barW, barY + 1, 0x33444444);
+            g.fill(sliderX, barY, sliderX + sliderW, barY + 1, 0xFFAAAAAA);
+        }
     }
 
     /** 面板条目悬浮提示：物品显示完整 tooltip，流体/其他显示名称 */
@@ -384,25 +674,41 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
 
         // 先检查分类标签悬浮
         if (my >= topPos + PANEL_Y + 2 && my < topPos + PANEL_Y + 16) {
-            int tabX = leftPos + PANEL_X + 2;
+            int x = leftPos + PANEL_X + 2;
             int tabY = topPos + PANEL_Y + 2;
+            int viewW = PANEL_W - 12;
 
-            // 全部标签
-            String allLabel = "[全部]";
-            int tabW = font.width(allLabel) + 4;
-            if (mx >= tabX && mx < tabX + tabW && my >= tabY && my < tabY + 14) {
-                g.renderComponentTooltip(font, List.of(Component.literal("§7显示所有类型")), mx, my);
-                return;
+            // 与渲染相同的标签列表
+            List<Object[]> tabs = new ArrayList<>();
+            tabs.add(new Object[]{I18n.get("gui.ae2addon.mode2.tab_all"), 0, null});
+            for (String tag : tagRules) {
+                tabs.add(new Object[]{"[T:" + tag + "]", 2, "tag:" + tag});
             }
-            tabX += tabW;
-
-            // 动态类型标签
+            for (String mod : modRules) {
+                tabs.add(new Object[]{"[M:" + mod + "]", 3, "mod:" + mod});
+            }
             for (ResourceLocation typeId : availableTypes) {
-                String label = "[" + getTypeDisplayName(typeId) + "]";
-                tabW = font.width(label) + 4;
+                tabs.add(new Object[]{"[" + getTypeDisplayName(typeId) + "]", 1, typeId});
+            }
+
+            int tabX = x - tabScrollOffset;
+            for (Object[] t : tabs) {
+                String label = (String) t[0];
+                int kind = (Integer) t[1];
+                Object key = t[2];
+                int tabW = font.width(label) + 4;
                 if (mx >= tabX && mx < tabX + tabW && my >= tabY && my < tabY + 14) {
-                    Component desc = getTypeFilterTooltip(typeId);
-                    g.renderComponentTooltip(font, List.of(Component.literal("§7筛选: ").append(desc)), mx, my);
+                    Component desc;
+                    if (kind == 0) {
+                        desc = Component.translatable("gui.ae2addon.mode2.show_all");
+                    } else if (kind == 1) {
+                        desc = Component.translatable("gui.ae2addon.mode2.filter_by").append(getTypeFilterTooltip((ResourceLocation) key));
+                    } else if (kind == 2) {
+                        desc = Component.translatable("gui.ae2addon.mode2.filter_tag", key);
+                    } else {
+                        desc = Component.translatable("gui.ae2addon.mode2.filter_mod", key);
+                    }
+                    g.renderComponentTooltip(font, List.of(desc), mx, my);
                     return;
                 }
                 tabX += tabW;
@@ -430,7 +736,7 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
             if (entry.isInfinite) {
                 // 在 tooltip 最下方追加 ∞ 标记
                 lines.add(Component.literal(""));
-                lines.add(Component.literal("§e∞ 无限"));
+                lines.add(Component.translatable("gui.ae2addon.mode2.infinite"));
             }
             g.renderComponentTooltip(font, lines, mx, my);
         } else {
@@ -438,9 +744,9 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
             List<Component> lines = new ArrayList<>();
             lines.add(key.getDisplayName());
             if (entry.isInfinite) {
-                lines.add(Component.literal("§e∞ 无限"));
+                lines.add(Component.translatable("gui.ae2addon.mode2.infinite"));
             } else {
-                lines.add(Component.literal("§7数量: §b" + formatAmount(entry.amount)));
+                lines.add(Component.translatable("gui.ae2addon.mode2.amount", formatAmount(entry.amount)));
             }
             g.renderComponentTooltip(font, lines, mx, my);
         }
@@ -454,18 +760,22 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
 
     /** 获取分类过滤器的工具提示描述 */
     private static Component getTypeFilterTooltip(ResourceLocation typeId) {
-        if (typeId.equals(AEKeyType.items().getId())) return Component.literal("§e物品");
-        if (typeId.equals(AEKeyType.fluids().getId())) return Component.literal("§b流体");
+        if (typeId.equals(AEKeyType.items().getId())) {
+            return Component.literal("§e").append(Component.translatable("gui.ae2addon.type.items"));
+        }
+        if (typeId.equals(AEKeyType.fluids().getId())) {
+            return Component.literal("§b").append(Component.translatable("gui.ae2addon.type.fluids"));
+        }
         return Component.literal("§d" + typeId.getPath());
     }
 
     private String getTypeDisplayName(ResourceLocation typeId) {
-        if (typeId.equals(AEKeyType.items().getId())) return "物品";
-        if (typeId.equals(AEKeyType.fluids().getId())) return "流体";
+        if (typeId.equals(AEKeyType.items().getId())) return I18n.get("gui.ae2addon.type.items");
+        if (typeId.equals(AEKeyType.fluids().getId())) return I18n.get("gui.ae2addon.type.fluids");
         String path = typeId.getPath();
         if (path.equals("emc")) return "emc";
         if (path.equals("fe") || path.equals("rf")) return path;
-        if (path.startsWith("gas")) return "气体";
+        if (path.startsWith("gas")) return I18n.get("gui.ae2addon.type.gas");
         if (path.length() > 4) return path.substring(0, 4);
         return path;
     }
@@ -473,23 +783,76 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
     private void renderFilterTabs(GuiGraphics g, int mx, int my) {
         int x = leftPos + PANEL_X + 2;
         int y = topPos + PANEL_Y + 2;
-        int tabX = x;
+        int viewW = PANEL_W - 12; // 右侧留滚动条空间
 
-        // 全部标签
-        boolean allActive = currentTypeFilter == null;
-        boolean allHover = mx >= tabX && mx < tabX + 44 && my >= y && my < y + 14;
-        String allColor = allActive ? "§b" : (allHover ? "§7" : "§8");
-        g.drawString(font, Component.literal(allColor + "[全部]"), tabX, y, 0xFFFFFF, false);
-        tabX += font.width("[全部]") + 4;
-
-        // 动态类型标签
+        // 收集所有标签（规则 + 类型）
+        List<Object[]> tabs = new ArrayList<>();
+        // [label, kind(0=all/1=type/2=tag/3=mod), key]
+        tabs.add(new Object[]{I18n.get("gui.ae2addon.mode2.tab_all"), 0, null});
+        for (String tag : tagRules) {
+            tabs.add(new Object[]{"[T:" + tag + "]", 2, "tag:" + tag});
+        }
+        for (String mod : modRules) {
+            tabs.add(new Object[]{"[M:" + mod + "]", 3, "mod:" + mod});
+        }
         for (ResourceLocation typeId : availableTypes) {
-            boolean active = typeId.equals(currentTypeFilter);
-            boolean hover = mx >= tabX && mx < tabX + 44 && my >= y && my < y + 14;
-            String color = active ? "§b" : (hover ? "§7" : "§8");
-            String label = "[" + getTypeDisplayName(typeId) + "]";
+            tabs.add(new Object[]{"[" + getTypeDisplayName(typeId) + "]", 1, typeId});
+        }
+
+        // 总宽
+        int totalW = 0;
+        for (Object[] t : tabs) {
+            totalW += font.width((String) t[0]) + 4;
+        }
+
+        // 需要滚动时限制偏移
+        int maxScroll = Math.max(0, totalW - viewW);
+        if (tabScrollOffset > maxScroll) tabScrollOffset = maxScroll;
+        if (tabScrollOffset < 0) tabScrollOffset = 0;
+
+        int tabX = x - tabScrollOffset;
+        for (Object[] t : tabs) {
+            String label = (String) t[0];
+            int kind = (Integer) t[1];
+            Object key = t[2];
+            int w = font.width(label) + 4;
+
+            // 裁剪：完全在可视区左侧/右侧的跳过
+            if (tabX + w < x || tabX > x + viewW) {
+                tabX += w;
+                continue;
+            }
+
+            boolean active;
+            if (kind == 0) {
+                active = currentTypeFilter == null && currentRuleFilter == null;
+            } else if (kind == 1) {
+                active = key.equals(currentTypeFilter) && currentRuleFilter == null;
+            } else {
+                active = key.equals(currentRuleFilter);
+            }
+            boolean hover = mx >= tabX && mx < tabX + w && my >= y && my < y + 14;
+            String color;
+            if (kind == 2) {
+                color = active ? "§b" : (hover ? "§7" : "§8");
+            } else if (kind == 3) {
+                color = active ? "§d" : (hover ? "§7" : "§8");
+            } else {
+                color = active ? "§b" : (hover ? "§7" : "§8");
+            }
             g.drawString(font, Component.literal(color + label), tabX, y, 0xFFFFFF, false);
-            tabX += font.width(label) + 4;
+            tabX += w;
+        }
+
+        // 标签行内底部横向滚动条（仅当内容超宽）
+        if (totalW > viewW) {
+            int barX = x;
+            int barY = y + 13;
+            int barW = viewW;
+            int sliderW = Math.max(10, (int) (barW * (double) viewW / totalW));
+            int sliderX = barX + (int) ((barW - sliderW) * ((double) tabScrollOffset / maxScroll));
+            g.fill(barX, barY, barX + barW, barY + 1, 0x33444444);
+            g.fill(sliderX, barY, sliderX + sliderW, barY + 1, 0xFFAAAAAA);
         }
     } 
 
@@ -501,19 +864,22 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         g.fill(x, y, x + PANEL_W, y + PANEL_H, 0xCC111111);
 
         // 面板标题
-        String header = "§6─ 存储类型一览";
+        String header = currentRuleFilter != null
+                ? I18n.get("gui.ae2addon.mode2.header_rules", currentRuleFilter)
+                : I18n.get("gui.ae2addon.mode2.header_types");
         int headerW = font.width(header);
         g.drawString(font, Component.literal(header), x + 2, topPos + PANEL_Y - 36, 0xFFFFAA, false);
-        String countStr = "§7" + displayItems.size() + "种";
-        if (currentTypeFilter != null || !searchBox.getValue().isEmpty()) {
+        int srcSize = (currentRuleFilter != null) ? ruleItems.size() : displayItems.size();
+        String countStr = I18n.get("gui.ae2addon.mode2.count_kinds", srcSize);
+        if (currentTypeFilter != null || currentRuleFilter != null || !searchBox.getValue().isEmpty()) {
             countStr += "/" + filteredItems.size();
         }
         g.drawString(font, Component.literal(countStr), x + 6 + headerW, topPos + PANEL_Y - 36, 0x888888, false);
 
         if (filteredItems.isEmpty()) {
-            String msg = displayItems.isEmpty()
-                    ? "§7存入后会出现在这里"
-                    : "§7无匹配";
+            String msg = displayItems.isEmpty() && currentRuleFilter == null
+                    ? I18n.get("gui.ae2addon.mode2.empty_hint")
+                    : I18n.get("gui.ae2addon.mode2.no_match");
             g.drawString(font, Component.literal(msg), x + 8, y + 6, 0x888888, false);
             return;
         }
@@ -551,14 +917,17 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
                 g.renderItemDecorations(font, iconStack, x + 2, rowY);
             }
 
-            // 物品名
+            // 物品名（规则分类下黑名单物品变红）
+            boolean isBlocked = currentRuleFilter != null && !isInfinite;
             String name = key.getDisplayName().getString();
             if (font.width(name) > 80) name = font.plainSubstrByWidth(name, 77) + "…";
-            g.drawString(font, name, x + 20, rowY + 3, isInfinite ? 0xFFFFAA : 0xCCCCCC, false);
+            g.drawString(font, name, x + 20, rowY + 3, isBlocked ? 0xFF5555 : (isInfinite ? 0xFFFFAA : 0xCCCCCC), false);
 
             // 数量/无限
             if (isInfinite) {
                 g.drawString(font, Component.literal("§b∞"), x + PANEL_W - 20, rowY + 3, 0x55FFFF, false);
+            } else if (isBlocked) {
+                g.drawString(font, Component.translatable("gui.ae2addon.mode2.blacklisted"), x + PANEL_W - 30, rowY + 3, 0xFF5555, false);
             } else {
                 String ct = formatAmount(amount);
                 int cw = font.width(ct);
@@ -589,25 +958,99 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
     @Override
     public boolean mouseClicked(double mx, double my, int button) {
         if (uiState == 0) return super.mouseClicked(mx, my, button);
-        // 检查分类标签点击（标签行区域）
-        if (my >= topPos + PANEL_Y + 2 && my < topPos + PANEL_Y + 16) {
-            int tabX = leftPos + PANEL_X + 2;
-            int tabW = font.width("[全部]") + 4;
-            if (mx >= tabX && mx < tabX + tabW) {
-                currentTypeFilter = null;
-                applyFilters();
+
+        // 滑条命中（优先于行/标签点击；Shift 时保留原删除/切换语义）
+        if (button == 0 && !hasShiftDown()) {
+            if (hitMainScrollbar(mx, my)) {
+                draggingScrollbar = 1;
+                dragMainScrollbar(my);
                 return true;
             }
-            tabX += tabW;
-            for (ResourceLocation typeId : availableTypes) {
-                String label = "[" + getTypeDisplayName(typeId) + "]";
-                tabW = font.width(label) + 4;
-                if (mx >= tabX && mx < tabX + tabW) {
-                    currentTypeFilter = typeId;
-                    applyFilters();
+            if (hitRuleScrollbar(mx, my)) {
+                draggingScrollbar = 2;
+                dragRuleScrollbar(mx);
+                return true;
+            }
+            if (hitTabScrollbar(mx, my)) {
+                draggingScrollbar = 3;
+                dragTabScrollbar(mx);
+                return true;
+            }
+        }
+
+        // 规则条点击删除（y=62~72）—— 需要 Shift+左键，防误触
+        if (my >= topPos + 62 && my < topPos + 72 && hasShiftDown()) {
+            String modeStr = ruleInstant ? I18n.get("gui.ae2addon.mode2.instant_short") : I18n.get("gui.ae2addon.mode2.touch_short");
+            String header = I18n.get("gui.ae2addon.mode2.batch_header", modeStr);
+            int headerW = font.width(header) + 4;
+            int cx = leftPos + 10 + headerW - ruleBarScrollOffset;
+            for (String tag : tagRules) {
+                int w = font.width("[tag:" + tag + "]") + 18;
+                if (mx >= cx && mx < cx + w) {
+                    menu.sendRemoveTagRule(tag);
                     return true;
                 }
-                tabX += tabW;
+                cx += w;
+            }
+            for (String mod : modRules) {
+                int w = font.width("[mod:" + mod + "]") + 18;
+                if (mx >= cx && mx < cx + w) {
+                    menu.sendRemoveModRule(mod);
+                    return true;
+                }
+                cx += w;
+            }
+        }
+
+        // 检查分类标签点击（标签行区域）
+        if (my >= topPos + PANEL_Y + 2 && my < topPos + PANEL_Y + 16) {
+            int x = leftPos + PANEL_X + 2;
+            int viewW = PANEL_W - 12;
+
+            // 与渲染相同的标签列表
+            List<Object[]> tabs = new ArrayList<>();
+            tabs.add(new Object[]{I18n.get("gui.ae2addon.mode2.tab_all"), 0, null});
+            for (String tag : tagRules) {
+                tabs.add(new Object[]{"[T:" + tag + "]", 2, "tag:" + tag});
+            }
+            for (String mod : modRules) {
+                tabs.add(new Object[]{"[M:" + mod + "]", 3, "mod:" + mod});
+            }
+            for (ResourceLocation typeId : availableTypes) {
+                tabs.add(new Object[]{"[" + getTypeDisplayName(typeId) + "]", 1, typeId});
+            }
+
+            int totalW = 0;
+            for (Object[] t : tabs) {
+                totalW += font.width((String) t[0]) + 4;
+            }
+            int maxScroll = Math.max(0, totalW - viewW);
+
+            int tabX = x - tabScrollOffset;
+            for (Object[] t : tabs) {
+                String label = (String) t[0];
+                int kind = (Integer) t[1];
+                Object key = t[2];
+                int w = font.width(label) + 4;
+                if (mx >= tabX && mx < tabX + w) {
+                    if (kind == 0) {
+                        // 全部：清类型 + 清规则
+                        currentTypeFilter = null;
+                        selectRuleFilter(null);
+                    } else if (kind == 1) {
+                        // 类型标签：只设类型筛选，不影响规则
+                        currentRuleFilter = null;
+                        ruleItems.clear();
+                        currentTypeFilter = (ResourceLocation) key;
+                        scrollOffset = 0;
+                        applyFilters();
+                    } else if (kind == 2 || kind == 3) {
+                        // 规则标签：进规则分类
+                        selectRuleFilter((String) key);
+                    }
+                    return true;
+                }
+                tabX += w;
             }
         } 
 
@@ -616,8 +1059,14 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
             int row = getClickedRow(mx, my);
             if (row >= 0 && row < filteredItems.size()) {
                 if (hasShiftDown()) {
-                    menu.sendToggleInfinite(filteredItems.get(row).key.toTagGeneric(
-                            Minecraft.getInstance().level.registryAccess()));
+                    if (currentRuleFilter != null) {
+                        // 规则分类模式下：Shift+点击 = 切换黑名单
+                        menu.sendToggleBlacklist(filteredItems.get(row).key.toTagGeneric(
+                                Minecraft.getInstance().level.registryAccess()));
+                    } else {
+                        menu.sendToggleInfinite(filteredItems.get(row).key.toTagGeneric(
+                                Minecraft.getInstance().level.registryAccess()));
+                    }
                     return true;
                 }
                 return true;
@@ -630,10 +1079,48 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
     @Override
     public boolean mouseScrolled(double mx, double my, double horizontal, double vertical) {
         if (uiState == 0) return super.mouseScrolled(mx, my, horizontal, vertical);
+        double delta = vertical;
+        // 规则条横向滚动（y=62~72）
+        if (my >= topPos + 62 && my < topPos + 72
+                && mx >= leftPos + 10 && mx < leftPos + 10 + PANEL_W) {
+            int headerW = font.width(I18n.get("gui.ae2addon.mode2.batch_header",
+                    ruleInstant ? I18n.get("gui.ae2addon.mode2.instant_short") : I18n.get("gui.ae2addon.mode2.touch_short"))) + 4;
+            int totalW = headerW;
+            for (String tag : tagRules) {
+                totalW += font.width("[tag:" + tag + "]") + 18;
+            }
+            for (String mod : modRules) {
+                totalW += font.width("[mod:" + mod + "]") + 18;
+            }
+            int maxScroll = Math.max(0, totalW - PANEL_W);
+            int step = 24;
+            if (delta < 0) {
+                ruleBarScrollOffset = Math.min(ruleBarScrollOffset + step, maxScroll);
+            } else if (delta > 0) {
+                ruleBarScrollOffset = Math.max(ruleBarScrollOffset - step, 0);
+            }
+            return true;
+        }
+        // 标签行横向滚动
+        if (my >= topPos + PANEL_Y + 2 && my < topPos + PANEL_Y + 16) {
+            int x = leftPos + PANEL_X + 2;
+            int viewW = PANEL_W - 12;
+            if (mx >= x && mx < x + PANEL_W) {
+                int totalW = computeTabsWidth();
+                int maxScroll = Math.max(0, totalW - viewW);
+                int step = 20;
+                if (delta < 0) {
+                    tabScrollOffset = Math.min(tabScrollOffset + step, maxScroll);
+                } else if (delta > 0) {
+                    tabScrollOffset = Math.max(tabScrollOffset - step, 0);
+                }
+                return true;
+            }
+        }
         if (isInPanelArea(mx, my)) {
-            if (vertical < 0) {
+            if (delta < 0) {
                 scrollOffset = Math.min(scrollOffset + 1, Math.max(0, filteredItems.size() - maxVisibleRows));
-            } else if (vertical > 0) {
+            } else if (delta > 0) {
                 scrollOffset = Math.max(scrollOffset - 1, 0);
             }
             return true;
@@ -641,19 +1128,164 @@ public class Mode2ConfigScreen extends AbstractContainerScreen<Mode2ConfigMenu> 
         return super.mouseScrolled(mx, my, horizontal, vertical);
     }
 
+    /** 计算分类标签行总宽度（与渲染一致） */
+    private int computeTabsWidth() {
+        int total = font.width(I18n.get("gui.ae2addon.mode2.tab_all")) + 4;
+        for (String tag : tagRules) {
+            total += font.width("[T:" + tag + "]") + 4;
+        }
+        for (String mod : modRules) {
+            total += font.width("[M:" + mod + "]") + 4;
+        }
+        for (ResourceLocation typeId : availableTypes) {
+            total += font.width("[" + getTypeDisplayName(typeId) + "]") + 4;
+        }
+        return total;
+    }
+
     @Override
     public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
         if (uiState == 0) return super.keyPressed(keyCode, scanCode, modifiers);
-        // 搜索框获得焦点时，E键不应关闭界面（让'e'正常输入到搜索框）
-        if (searchBox.isFocused() && this.minecraft.options.keyInventory.matches(keyCode, scanCode)) {
+        // 搜索框/阈值/规则输入框获得焦点时：优先输入，并吞掉所有按键——
+        // 防止其他 mod 快捷键（如 Curios 饰品栏 G 键）在输入时触发并关闭界面
+        if (searchBox.isFocused() || ruleInput.isFocused()
+                || (thresholdInput != null && thresholdInput.isFocused())) {
+            // Esc：保留关闭界面能力
+            if (keyCode == 256) {
+                return super.keyPressed(keyCode, scanCode, modifiers);
+            }
             for (var child : children()) {
                 if (child.keyPressed(keyCode, scanCode, modifiers)) {
                     return true;
                 }
             }
-            return false;
+            // 文本框未消费的键也吞掉（含 E/G 等），避免 KeyMapping 被触发
+            return true;
         }
         return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    @Override
+    public boolean mouseDragged(double mx, double my, int button, double dragX, double dragY) {
+        if (uiState == 0) return super.mouseDragged(mx, my, button, dragX, dragY);
+        if (button == 0) {
+            if (draggingScrollbar == 1) {
+                dragMainScrollbar(my);
+                return true;
+            }
+            if (draggingScrollbar == 2) {
+                dragRuleScrollbar(mx);
+                return true;
+            }
+            if (draggingScrollbar == 3) {
+                dragTabScrollbar(mx);
+                return true;
+            }
+        }
+        return super.mouseDragged(mx, my, button, dragX, dragY);
+    }
+
+    @Override
+    public boolean mouseReleased(double mx, double my, int button) {
+        if (button == 0 && draggingScrollbar != 0) {
+            draggingScrollbar = 0;
+            return true;
+        }
+        return super.mouseReleased(mx, my, button);
+    }
+
+    // ── 三个滑条的拖拽支持（几何与渲染一致；命中区域适当放大） ──
+
+    /** 主列表垂直滑条命中（右侧 4px 轨道） */
+    private boolean hitMainScrollbar(double mx, double my) {
+        if (filteredItems.size() <= maxVisibleRows) return false;
+        int x = leftPos + PANEL_X;
+        int y = topPos + PANEL_Y + 16;
+        return mx >= x + PANEL_W - 4 && mx <= x + PANEL_W + 1
+                && my >= y && my <= y + PANEL_H;
+    }
+
+    private void dragMainScrollbar(double my) {
+        int totalRows = filteredItems.size();
+        if (totalRows <= maxVisibleRows) return;
+        int y = topPos + PANEL_Y + 16;
+        int maxScroll = Math.max(0, totalRows - maxVisibleRows);
+        int barH = Math.max(maxVisibleRows * PANEL_H / totalRows, 8);
+        double ratio = (my - y - barH / 2.0) / Math.max(1, PANEL_H - barH);
+        scrollOffset = (int) Math.round(ratio * maxScroll);
+        scrollOffset = Math.max(0, Math.min(scrollOffset, maxScroll));
+    }
+
+    /** 规则条横向滑条命中（barY 起向下 4px） */
+    private boolean hitRuleScrollbar(double mx, double my) {
+        int totalW = computeRuleBarWidth();
+        int viewW = PANEL_W - 14;
+        if (totalW <= viewW) return false;
+        int x = leftPos + 10;
+        int headerW = ruleBarHeaderWidth();
+        int barX = x + headerW;
+        int barY = topPos + 62 + 11;
+        int barW = viewW - 8;
+        return my >= barY && my <= barY + 4
+                && mx >= barX - 2 && mx <= barX + barW + 2;
+    }
+
+    private void dragRuleScrollbar(double mx) {
+        int totalW = computeRuleBarWidth();
+        int viewW = PANEL_W - 14;
+        int maxScroll = Math.max(0, totalW - viewW);
+        if (maxScroll <= 0) return;
+        int x = leftPos + 10;
+        int headerW = ruleBarHeaderWidth();
+        int barX = x + headerW;
+        int barW = viewW - 8;
+        int sliderW = Math.max(12, (int) (barW * (double) viewW / totalW));
+        double ratio = (mx - barX - sliderW / 2.0) / Math.max(1, barW - sliderW);
+        ruleBarScrollOffset = (int) Math.round(ratio * maxScroll);
+        ruleBarScrollOffset = Math.max(0, Math.min(ruleBarScrollOffset, maxScroll));
+    }
+
+    private int ruleBarHeaderWidth() {
+        String modeStr = ruleInstant
+                ? I18n.get("gui.ae2addon.mode2.instant_short")
+                : I18n.get("gui.ae2addon.mode2.touch_short");
+        return font.width(I18n.get("gui.ae2addon.mode2.batch_header", modeStr)) + 4;
+    }
+
+    private int computeRuleBarWidth() {
+        int total = ruleBarHeaderWidth();
+        for (String tag : tagRules) {
+            total += font.width("[tag:" + tag + "]") + 18;
+        }
+        for (String mod : modRules) {
+            total += font.width("[mod:" + mod + "]") + 18;
+        }
+        return total;
+    }
+
+    /** 标签行横向滑条命中（barY 起向下 4px，避开标签文字） */
+    private boolean hitTabScrollbar(double mx, double my) {
+        int totalW = computeTabsWidth();
+        int viewW = PANEL_W - 12;
+        if (totalW <= viewW) return false;
+        int barX = leftPos + PANEL_X + 2;
+        int barY = topPos + PANEL_Y + 2 + 13;
+        int barW = viewW;
+        return my >= barY && my <= barY + 4
+                && mx >= barX - 2 && mx <= barX + barW + 2;
+    }
+
+    private void dragTabScrollbar(double mx) {
+        int totalW = computeTabsWidth();
+        int viewW = PANEL_W - 12;
+        int maxScroll = Math.max(0, totalW - viewW);
+        if (maxScroll <= 0) return;
+        int barX = leftPos + PANEL_X + 2;
+        int barW = viewW;
+        int sliderW = Math.max(10, (int) (barW * (double) viewW / totalW));
+        double ratio = (mx - barX - sliderW / 2.0) / Math.max(1, barW - sliderW);
+        tabScrollOffset = (int) Math.round(ratio * maxScroll);
+        tabScrollOffset = Math.max(0, Math.min(tabScrollOffset, maxScroll));
     }
 
     private boolean isInPanelArea(double mx, double my) {

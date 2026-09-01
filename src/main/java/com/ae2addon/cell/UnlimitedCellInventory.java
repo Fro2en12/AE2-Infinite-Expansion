@@ -9,13 +9,19 @@ import appeng.api.storage.cells.StorageCell;
 import com.ae2addon.AE2Addon;
 import com.ae2addon.data.CellDataSavedData;
 import net.minecraft.core.HolderLookup;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.material.Fluid;
+import net.minecraft.world.level.material.Fluids;
 import net.neoforged.neoforge.server.ServerLifecycleHooks;
 
 import java.math.BigInteger;
@@ -26,13 +32,14 @@ import java.util.*;
  * <p>
  * 三模式驱动：
  * - Mode 1: 无限制存储
- * - Mode 2: 自定义无限（白名单 + 阈值 + 臻藏）
+ * - Mode 2: 自定义无限（白名单 + 阈值 + 臻藏 + tag/mod 批量规则）
  * - Mode 3: 全类型无限
  */
 public class UnlimitedCellInventory implements StorageCell {
 
-    public static final long INFINITE = Long.MAX_VALUE; // 9223372036854775807
-    public static final long INFINITE_BYTES = 300000000; // 无限类型在面板中显示的字节数
+    // 1.21 迁移（对齐 upstream/main）：非 final，随配置热加载（AE2AddonConfig.apply 赋值）
+    public static volatile long INFINITE = com.ae2addon.config.AE2AddonConfig.infiniteItemAmount(); // 9223372036854775807
+    public static volatile long INFINITE_BYTES = com.ae2addon.config.AE2AddonConfig.cellDisplayBytes(); // 无限类型在面板中显示的字节数
 
     /**
      * 报告给 AE2 网络的"无限"显示值。
@@ -41,6 +48,8 @@ public class UnlimitedCellInventory implements StorageCell {
      * 会累加溢出为负数，导致 AE2WTLib 补货悬浮层调用 ReadableNumberConverter.format(负数)
      * 直接崩溃。此值约 1.15e18，8 个同类型条目累加才到 Long.MAX_VALUE，远低于实际会溢出的场景；
      * 提取时仍返回真无限 {@link #INFINITE}，功能不受影响。
+     * <p>
+     * 上报改用 set 取最大（见 {@link #addInfinite}）：同类型多条无限记录不再累加。
      */
     public static final long DISPLAY_INFINITE = Long.MAX_VALUE / 8;
 
@@ -58,6 +67,21 @@ public class UnlimitedCellInventory implements StorageCell {
     /** 承诺额度：升级为无限时的记录数（用 long 够用） */
     private Map<AEKey, Long> ca = new HashMap<>();
     private Set<AEKey> m3 = new HashSet<>();
+    /** Mode 2 按 tag 批量无限（如 "minecraft:logs"） */
+    private Set<String> tags = new HashSet<>();
+    /** Mode 2 按 mod 批量无限（如 "gtceu"） */
+    private Set<String> mods = new HashSet<>();
+    /** 规则生效模式：true=立即全量无限，false=触碰（存入过）后无限 */
+    private boolean ruleInstant = true;
+    /** 触碰模式下记录过的匹配物品 */
+    private Set<AEKey> ruleTouched = new HashSet<>();
+    /** 黑名单：即使命中规则也禁止无限 */
+    private Set<AEKey> blacklist = new HashSet<>();
+
+    private static List<AEKey> ALL_KEYS_CACHE = null;
+    private static Set<AEKey> ALL_KEYS_SET = null;
+    private static int ALL_KEYS_VERSION = -1;
+    private static boolean ALL_KEYS_INIT = false;
 
     private boolean dataDirty = false;
 
@@ -141,6 +165,15 @@ public class UnlimitedCellInventory implements StorageCell {
         ca.putAll(data.ca);
         m3.clear();
         m3.addAll(data.m3);
+        tags.clear();
+        tags.addAll(data.tags);
+        mods.clear();
+        mods.addAll(data.mods);
+        ruleInstant = data.ruleInstant;
+        ruleTouched.clear();
+        ruleTouched.addAll(data.ruleTouched);
+        blacklist.clear();
+        blacklist.addAll(data.blacklist);
     }
 
     private void save() {
@@ -162,6 +195,15 @@ public class UnlimitedCellInventory implements StorageCell {
         data.ca.putAll(ca);
         data.m3.clear();
         data.m3.addAll(m3);
+        data.tags.clear();
+        data.tags.addAll(tags);
+        data.mods.clear();
+        data.mods.addAll(mods);
+        data.ruleInstant = ruleInstant;
+        data.ruleTouched.clear();
+        data.ruleTouched.addAll(ruleTouched);
+        data.blacklist.clear();
+        data.blacklist.addAll(blacklist);
         savedData.setDirty();
         updateSummary();
         if (saveProvider != null) {
@@ -183,52 +225,68 @@ public class UnlimitedCellInventory implements StorageCell {
 
     private void updateSummary() {
         CompoundTag tag = AE2Addon.cellTag(cellItem);
-        long bytes = 0L;
+        BigInteger bytes = BigInteger.ZERO;
         int types = 0;
         long infiniteCount = 0;
         if (mode == 1) {
             for (BigInteger v : s1.values()) {
-                bytes += v.min(BigInteger.valueOf(Long.MAX_VALUE - bytes)).longValue();
-                if (bytes < 0) bytes = Long.MAX_VALUE;
+                bytes = bytes.add(v);
                 types++;
             }
         } else if (mode == 2) {
-            if (workMode == 1) {
-                for (Map.Entry<AEKey, BigInteger> e : s2.entrySet()) {
-                    if (!wl.contains(e.getKey()) && !ul.contains(e.getKey())) {
-                        BigInteger v = e.getValue();
-                        bytes += v.min(BigInteger.valueOf(Long.MAX_VALUE - bytes)).longValue();
-                        if (bytes < 0) bytes = Long.MAX_VALUE;
-                        types++;
+            // 批量规则也算无限类型（跳过已在 wl/ul 的，避免重复计数）
+            int ruleCount = 0;
+            if (!tags.isEmpty() || !mods.isEmpty()) {
+                if (ruleInstant) {
+                    ensureAllKeysCache();
+                    for (AEKey k : ALL_KEYS_CACHE) {
+                        if (!wl.contains(k) && !ul.contains(k)
+                                && matchesRule(k) && !blacklist.contains(k)) ruleCount++;
+                    }
+                } else {
+                    for (AEKey k : ruleTouched) {
+                        if (!wl.contains(k) && !ul.contains(k)
+                                && matchesRule(k) && !blacklist.contains(k)) ruleCount++;
                     }
                 }
-                infiniteCount = ul.size();
+            }
+            if (workMode == 1) {
+                for (BigInteger v : s2.values()) {
+                    bytes = bytes.add(v);
+                    types++;
+                }
+                infiniteCount = ul.size() + ruleCount;
                 types += infiniteCount;
             } else if (workMode == 2) {
-                infiniteCount = ul.size();
+                infiniteCount = ul.size() + ruleCount;
                 types += infiniteCount;
             } else {
                 // wm3: wl + ul（去重）为无限，s2 里非无限的要统计
                 for (BigInteger v : s2.values()) {
-                    bytes += v.min(BigInteger.valueOf(Long.MAX_VALUE - bytes)).longValue();
-                    if (bytes < 0) bytes = Long.MAX_VALUE;
+                    bytes = bytes.add(v);
                 }
-                infiniteCount = wl.size() + ul.size() - countWlInUl();
-                // s2 中非 wl/ul 的才算类型数
+                infiniteCount = wl.size() + ul.size() - countWlInUl() + ruleCount;
+                // s2 中非 wl/ul/规则命中的才算类型数
                 int s2Types = 0;
                 for (AEKey k : s2.keySet()) {
-                    if (!wl.contains(k) && !ul.contains(k)) s2Types++;
+                    if (!wl.contains(k) && !ul.contains(k) && !ruleActive(k)) s2Types++;
                 }
                 types = (int) (infiniteCount + s2Types);
             }
         }
         if (infiniteCount > 0) {
-            long addBytes = infiniteCount * INFINITE_BYTES;
-            bytes += addBytes;
-            if (bytes < 0) bytes = Long.MAX_VALUE;
+            bytes = bytes.add(BigInteger.valueOf(infiniteCount).multiply(BigInteger.valueOf(INFINITE_BYTES)));
         }
-        if (tag.getLong("_b") != bytes) {
-            tag.putLong("_b", bytes);
+        // 新格式：BigInteger byte array（突破 Long 上限）
+        byte[] newBytes = bytes.toByteArray();
+        byte[] oldBytes = tag.getByteArray("_b2");
+        if (!java.util.Arrays.equals(oldBytes, newBytes)) {
+            tag.putByteArray("_b2", newBytes);
+        }
+        // 兼容旧格式：long 截断
+        long compat = bytes.min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+        if (tag.getLong("_b") != compat) {
+            tag.putLong("_b", compat);
         }
         if (tag.getInt("_t") != types) {
             tag.putInt("_t", types);
@@ -236,8 +294,13 @@ public class UnlimitedCellInventory implements StorageCell {
         AE2Addon.setCellTag(cellItem, tag);
     }
 
-    public long getCachedBytes() {
-        return AE2Addon.cellTag(cellItem).getLong("_b");
+    /** 读取已存储字节数（BigInteger，突破 Long 上限；兼容旧 long 格式） */
+    public BigInteger getCachedBytes() {
+        CompoundTag tag = AE2Addon.cellTag(cellItem);
+        if (tag.contains("_b2", 7)) { // TAG_BYTE_ARRAY
+            return new BigInteger(tag.getByteArray("_b2"));
+        }
+        return BigInteger.valueOf(tag.getLong("_b"));
     }
 
     public int getCachedTypes() {
@@ -245,17 +308,58 @@ public class UnlimitedCellInventory implements StorageCell {
     }
 
     public long insert(AEKey what, long amount, Actionable act, IActionSource src) {
+        return insert(what, amount, act, src, 0);
+    }
+
+    /** 内部 insert：depth 为解包深度（物质球套球最多解 2 层）。 */
+    private long insert(AEKey what, long amount, Actionable act, IActionSource src, int depth) {
         if (amount <= 0) return 0;
         if (act != Actionable.MODULATE) return amount;
 
-        // ── 无限路径：直接收下，不占内部存储 ──
-        if (mode == 3) {
-            m3.add(what);
-            // 必须持久化 m3：AE2 网络可能复用/重建 inventory 实例，
-            // 不 save 的话 m3 只存在于当前实例，重建后"已插入记录"丢失。
+        // ── 物质球特例（2026-08-27 22:16 sensei 要求）：存入物质球 → 自动解包入库 ──
+        // 物质球是取消无限时打包的临时容器（NBT 存 innerKey+amount），
+        // 存入元件时直接解包，球本身不入库。
+        if (depth < 2 && what instanceof AEItemKey ballKey
+                && ballKey.getItem() == com.ae2addon.init.ModItems.MATTER_BALL.get()
+                && ballKey.hasComponents()) {
+            ServerLevel level = getOverworld();
+            if (level != null) {
+                var ballStack = ballKey.toStack(1);
+                var innerKey = com.ae2addon.item.MatterBallItem.getKey(ballStack, level.registryAccess());
+                long innerAmount = com.ae2addon.item.MatterBallItem.getAmount(ballStack);
+                if (innerKey != null && innerAmount > 0) {
+                    insert(innerKey, innerAmount, act, src, depth + 1);
+                }
+            }
             dataDirty = true;
             save();
+            return amount; // 物质球本身不入库（已解包）
+        }
+
+        // ── 无限路径：直接收下，不占内部存储 ──
+        if (mode == 3) {
+            if (m3.add(what)) {
+                // 修复：Mode 3 插入记录必须持久化，否则重启后丢失
+                dataDirty = true;
+                save();
+            }
             return amount;
+        }
+        if (mode == 2) {
+            if (matchesRule(what) && !blacklist.contains(what)) {
+                // 触碰模式下记录一下，之后显示无限
+                if (!ruleInstant) {
+                    ruleTouched.add(what);
+                }
+                // 双轨合一：s2 中的存量并入承诺额度，避免同一物品被规则段和白名单段重复报告
+                BigInteger existing = s2.remove(what);
+                if (existing != null && existing.signum() > 0) {
+                    ca.put(what, Math.max(ca.getOrDefault(what, 0L), clampToLong(existing)));
+                }
+                dataDirty = true;
+                save();
+                return amount;
+            }
         }
         if (mode == 2 && workMode == 2) {
             if (!ul.contains(what)) ul.add(what);
@@ -264,12 +368,6 @@ public class UnlimitedCellInventory implements StorageCell {
             return amount;
         }
         if (mode == 2 && workMode == 3 && (wl.contains(what) || ul.contains(what))) {
-            return amount;
-        }
-        if (mode == 2 && workMode == 1 && (wl.contains(what) || ul.contains(what))) {
-            // 已在无限集合中的物品放回：保持无限，不进入有限存储 s2。
-            // 否则 s2 会残留少量数量，getAvailableStacks 中后写的 s2 条目会覆盖
-            // ul 的 INFINITE 显示，导致"取出后放回无限状态丢失"。
             return amount;
         }
 
@@ -320,6 +418,9 @@ public class UnlimitedCellInventory implements StorageCell {
         }
 
         if (mode == 2) {
+            if (ruleActive(what)) {
+                return Math.min(Math.max(amount, 0), INFINITE);
+            }
             if (workMode == 3) {
                 if (wl.contains(what) || ul.contains(what)) return Math.min(Math.max(amount, 0), INFINITE);
                 return extractFromMap(s2, what, amount, act);
@@ -338,46 +439,132 @@ public class UnlimitedCellInventory implements StorageCell {
         return extractFromMap((mode == 1) ? s1 : s2, what, amount, act);
     }
 
+    private static void ensureAllKeysCache() {
+        // 版本化缓存：注册表条目数变化时自动重建（新模组/数据包加载后不脏读）
+        int version = BuiltInRegistries.ITEM.keySet().size() + BuiltInRegistries.FLUID.keySet().size();
+        if (ALL_KEYS_INIT && ALL_KEYS_VERSION == version) return;
+        ALL_KEYS_INIT = true;
+        ALL_KEYS_VERSION = version;
+        List<AEKey> list = new ArrayList<>();
+        Set<AEKey> set = new HashSet<>();
+
+        Iterator<Item> itemIt = BuiltInRegistries.ITEM.stream().iterator();
+        while (itemIt.hasNext()) {
+            Item item = itemIt.next();
+            try {
+                AEItemKey k = AEItemKey.of(item);
+                if (k != null) {
+                    list.add(k);
+                    set.add(k);
+                }
+            } catch (Exception e) {
+                // skip
+            }
+        }
+
+        Iterator<Fluid> fluidIt = BuiltInRegistries.FLUID.stream().iterator();
+        while (fluidIt.hasNext()) {
+            Fluid fluid = fluidIt.next();
+            try {
+                if (fluid != Fluids.EMPTY) {
+                    AEFluidKey k = AEFluidKey.of(fluid);
+                    if (k != null) {
+                        list.add(k);
+                        set.add(k);
+                    }
+                }
+            } catch (Exception e) {
+                // skip
+            }
+        }
+
+        ALL_KEYS_CACHE = list;
+        ALL_KEYS_SET = set;
+    }
+
+    /**
+     * 安全报告无限库存：多个无限盘/普通存储聚合到同一 KeyCounter 时，
+     * add(Long.MAX) 累加会溢出成负数（模拟看到负库存 → 提取失败 → 缺料）。
+     * 改用 set 取最大值：多盘叠加仍是同一个值，不会溢出。
+     * 1.21 fork 保留了 DISPLAY_INFINITE（MAX/8）作显示上限，给同类型的有限存储留出累加余量。
+     */
+    private static void addInfinite(KeyCounter out, AEKey k) {
+        if (out.get(k) < DISPLAY_INFINITE) {
+            out.set(k, DISPLAY_INFINITE);
+        }
+    }
+
     public void getAvailableStacks(KeyCounter out) {
         if (mode == 3) {
-            // 只报告实际放入过的类型（m3）：任意类型放入即无限，终端显示已放入的类型。
+            // 所有注册物品/流体均为无限（upstream 演进：不再只报 m3 已放入的类型）
+            ensureAllKeysCache();
+            for (AEKey k : ALL_KEYS_CACHE) {
+                addInfinite(out, k);
+            }
             for (AEKey k : m3) {
-                out.add(k, DISPLAY_INFINITE);
+                // m3 中的 NBT 变体可能不在注册表缓存里；已在缓存中的不重复报告（防溢出）
+                if (!ALL_KEYS_SET.contains(k)) {
+                    addInfinite(out, k);
+                }
             }
             return;
         }
 
         if (mode == 2) {
+            // 规则命中的物品（tags/mods 批量无限）——跳过已在 wl/ul 的，避免重复报告导致 Long 溢出
+            if (!tags.isEmpty() || !mods.isEmpty()) {
+                if (ruleInstant) {
+                    // 立即模式：全量遍历所有注册物品
+                    ensureAllKeysCache();
+                    for (AEKey k : ALL_KEYS_CACHE) {
+                        if (!wl.contains(k) && !ul.contains(k)
+                                && matchesRule(k) && !blacklist.contains(k)) {
+                            addInfinite(out, k);
+                        }
+                    }
+                } else {
+                    // 触碰模式：只报告存入过的匹配物品
+                    for (AEKey k : ruleTouched) {
+                        if (!wl.contains(k) && !ul.contains(k)
+                                && matchesRule(k) && !blacklist.contains(k)) {
+                            addInfinite(out, k);
+                        }
+                    }
+                }
+            }
+
             if (workMode == 3) {
                 for (AEKey k : wl) {
-                    out.add(k, DISPLAY_INFINITE);
+                    addInfinite(out, k);
                 }
                 for (AEKey k : ul) {
                     if (!wl.contains(k)) {
-                        out.add(k, DISPLAY_INFINITE);
+                        addInfinite(out, k);
                     }
                 }
                 for (Map.Entry<AEKey, BigInteger> e : s2.entrySet()) {
-                    if (!wl.contains(e.getKey()) && !ul.contains(e.getKey())) {
-                        out.add(e.getKey(), clampToLong(e.getValue()));
+                    AEKey k = e.getKey();
+                    if (!wl.contains(k) && !ul.contains(k) && !ruleActive(k)) {
+                        out.add(k, clampToLong(e.getValue()));
                     }
                 }
                 return;
             }
 
             for (AEKey k : wl) {
-                out.add(k, DISPLAY_INFINITE);
+                addInfinite(out, k);
             }
             for (AEKey k : ul) {
                 if (!wl.contains(k)) {
-                    out.add(k, DISPLAY_INFINITE);
+                    addInfinite(out, k);
                 }
             }
 
             if (workMode == 1) {
                 for (Map.Entry<AEKey, BigInteger> e : s2.entrySet()) {
-                    if (!wl.contains(e.getKey()) && !ul.contains(e.getKey())) {
-                        out.add(e.getKey(), clampToLong(e.getValue()));
+                    AEKey k = e.getKey();
+                    if (!wl.contains(k) && !ul.contains(k) && !ruleActive(k)) {
+                        out.add(k, clampToLong(e.getValue()));
                     }
                 }
             }
@@ -391,12 +578,25 @@ public class UnlimitedCellInventory implements StorageCell {
     }
 
     public boolean isPreferredStorageFor(AEKey what, IActionSource src) {
+        if (mode == 1 || mode == 3) {
+            // 无限制存储 / 全类型无限：全收
+            return true;
+        }
+        if (mode == 2) {
+            if (workMode == 1 || workMode == 2) {
+                // 阈值 / 存入无限：需要收下物品才能升级为无限，全收
+                return true;
+            }
+            // 臻藏模式：只对白名单/已无限/规则命中的物品宣称首选，
+            // 其他物品留给网络中的其他存储，避免抢走不该收的
+            return wl.contains(what) || ul.contains(what) || ruleActive(what);
+        }
         return true;
     }
 
     public Component getDescription() {
-        String[] n = {"", "无限制", "自定义", "全类型"};
-        return Component.literal("§5万能无限 [" + n[mode] + "]");
+        String[] n = {"", "gui.ae2addon.mode.unlimited", "gui.ae2addon.mode.custom", "gui.ae2addon.mode.all"};
+        return Component.translatable("gui.ae2addon.cell.name", Component.translatable(n[mode]));
     }
 
     public CellState getStatus() {
@@ -568,6 +768,149 @@ public class UnlimitedCellInventory implements StorageCell {
 
     public UUID getUuid() {
         return uuid;
+    }
+
+    // ── tags / mods 批量无限规则 ──
+
+    public Set<String> getTags() {
+        return tags;
+    }
+
+    public Set<String> getMods() {
+        return mods;
+    }
+
+    /** 添加 tag 规则（如 "minecraft:logs"） */
+    public boolean addTagRule(String tag) {
+        if (tag == null || tag.isBlank()) return false;
+        String trimmed = tag.trim();
+        if (tags.add(trimmed)) {
+            dataDirty = true;
+            save();
+            return true;
+        }
+        return false;
+    }
+
+    /** 移除 tag 规则 */
+    public boolean removeTagRule(String tag) {
+        if (tags.remove(tag)) {
+            dataDirty = true;
+            save();
+            return true;
+        }
+        return false;
+    }
+
+    /** 添加 mod 规则（如 "gtceu"） */
+    public boolean addModRule(String mod) {
+        if (mod == null || mod.isBlank()) return false;
+        String trimmed = mod.trim();
+        if (mods.add(trimmed)) {
+            dataDirty = true;
+            save();
+            return true;
+        }
+        return false;
+    }
+
+    /** 移除 mod 规则 */
+    public boolean removeModRule(String mod) {
+        if (mods.remove(mod)) {
+            dataDirty = true;
+            save();
+            return true;
+        }
+        return false;
+    }
+
+    /** 规则生效模式：true=立即全量无限，false=触碰（存入过）后无限 */
+    public void setRuleInstant(boolean instant) {
+        if (ruleInstant == instant) return;
+        ruleInstant = instant;
+        dataDirty = true;
+        save();
+    }
+
+    public boolean isRuleInstant() {
+        return ruleInstant;
+    }
+
+    /** 该 AEKey 是否命中任意 tag/mod 规则（Mode 2 专用） */
+    private boolean matchesRule(AEKey key) {
+        if (tags.isEmpty() && mods.isEmpty()) return false;
+        if (key instanceof AEItemKey itemKey) {
+            // 2026-08-27 修复：带 NBT 的变体不参与 tag/mod 无限规则。
+            // 否则存入带 NBT 物品会被无限路径吞掉（return amount 不存内部）→
+            // 原始带 NBT 物品消失，只剩虚拟无限（sensei 实测 22:14：
+            // Mode2 tags/mods 规则下带 NBT 物品存入后消失）。
+            // 带 NBT 物品走正常存储（s2 累加），NBT 完整保留。
+            if (itemKey.hasComponents()) return false;
+            Item item = itemKey.getItem();
+            ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
+            if (id != null && mods.contains(id.getNamespace())) return true;
+            for (String tag : tags) {
+                ResourceLocation tagId;
+                try {
+                    tagId = ResourceLocation.parse(tag);
+                } catch (Exception e) {
+                    continue; // 非法 tag 名跳过，不抛到 insert/extract 热路径
+                }
+                TagKey<Item> tagKey = TagKey.create(Registries.ITEM, tagId);
+                if (item.builtInRegistryHolder().is(tagKey)) return true;
+            }
+        } else if (key instanceof AEFluidKey fluidKey) {
+            ResourceLocation id = BuiltInRegistries.FLUID.getKey(fluidKey.getFluid());
+            if (id != null && mods.contains(id.getNamespace())) return true;
+            for (String tag : tags) {
+                ResourceLocation tagId;
+                try {
+                    tagId = ResourceLocation.parse(tag);
+                } catch (Exception e) {
+                    continue; // 非法 tag 名跳过，不抛到 insert/extract 热路径
+                }
+                TagKey<Fluid> tagKey = TagKey.create(Registries.FLUID, tagId);
+                if (fluidKey.getFluid().builtInRegistryHolder().is(tagKey)) return true;
+            }
+        }
+        return false;
+    }
+
+    /** 规则是否对某 key 生效：立即模式全部命中，触碰模式需触碰过；黑名单永远排除 */
+    private boolean ruleActive(AEKey key) {
+        if (blacklist.contains(key)) return false;
+        if (!matchesRule(key)) return false;
+        return ruleInstant || ruleTouched.contains(key);
+    }
+
+    /** 是否在黑名单中 */
+    public boolean isBlacklisted(AEKey key) {
+        return blacklist.contains(key);
+    }
+
+    /** 切换黑名单状态，返回切换后是否在黑名单 */
+    public boolean toggleBlacklist(AEKey key) {
+        if (blacklist.contains(key)) {
+            blacklist.remove(key);
+            dataDirty = true;
+            save();
+            return false;
+        }
+        blacklist.add(key);
+        // 从触碰集合里也去掉（黑名单物品不该再显示无限）
+        ruleTouched.remove(key);
+        dataDirty = true;
+        save();
+        return true;
+    }
+
+    public Set<AEKey> getBlacklist() {
+        return blacklist;
+    }
+
+    /** Mode 2 是否命中规则（供外部判断） */
+    public boolean isInfiniteByRule(AEKey key) {
+        return mode == 2 && ruleActive(key);
     }
 
     public List<PanelItem> getPanelItems() {

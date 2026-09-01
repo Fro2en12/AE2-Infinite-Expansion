@@ -3,14 +3,21 @@
   "minVersion": "0.8",
   "package": "com.ae2addon.mixin",
   "compatibilityLevel": "JAVA_21",
+  "plugin": "com.ae2addon.mixin.AE2AddonMixinPlugin",
   "mixins": [
     "CraftingCPUClusterMixin",
     "GridMixin",
-    "TooltipsMixin"
+    "TooltipsMixin",
+    "CraftingCPUClusterAccessor",
+    "CraftingCpuLogicMixin",
+    "CraftingServiceMixin",
+    "MemoryCardItemMixin"
   ],
   "client": [
     "AEKeyTypeFormatAmountMixin",
-    "ReadableNumberConverterMixin"
+    "ReadableNumberConverterMixin",
+    "CPUSelectionListMixin",
+    "CraftConfirmScreenMixin"
   ],
   "server": []
 }

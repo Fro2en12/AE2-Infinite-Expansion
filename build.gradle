@@ -79,6 +79,11 @@ dependencies {
     // AppliedE 1.0.8-beta（NeoForge 1.21.1）— EMC 通道注册（编译+运行）
     compileOnly "maven.modrinth:appliede:1.0.8-beta"
     runtimeOnly "maven.modrinth:appliede:1.0.8-beta"
+    // 可选集成（运行时无则跳过；仅编译期需要）
+    compileOnly "maven.modrinth:appflux:1.21-2.1.4-neoforge"
+    compileOnly "maven.modrinth:extendedae-plus:1.21.1-1.4.3"
+    compileOnly "maven.modrinth:mekanism:10.7.19.85"
+    compileOnly "maven.modrinth:applied-mekanistics:1.6.3"
 }
 
 jar {

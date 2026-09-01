@@ -1,6 +1,8 @@
 package com.ae2addon.init;
 
 import com.ae2addon.AE2Addon;
+import com.ae2addon.gui.InfiniteInterfaceMenu;
+import com.ae2addon.gui.IntegratedCPUMenu;
 import com.ae2addon.gui.Mode2ConfigMenu;
 import com.ae2addon.gui.ModeSelectMenu;
 import net.minecraft.core.registries.Registries;
@@ -26,4 +28,14 @@ public class ModMenuTypes {
     public static final DeferredHolder<MenuType<?>, MenuType<Mode2ConfigMenu>> MODE2_CONFIG =
             MENUS.register("mode2_config",
                     () -> IMenuTypeExtension.create(Mode2ConfigMenu::fromNetwork));
+
+    // 集成 CPU 状态界面
+    public static final DeferredHolder<MenuType<?>, MenuType<IntegratedCPUMenu>> INTEGRATED_CPU =
+            MENUS.register("integrated_cpu",
+                    () -> IMenuTypeExtension.create(IntegratedCPUMenu::fromNetwork));
+
+    // ME 接口（无限级）配置界面
+    public static final DeferredHolder<MenuType<?>, MenuType<InfiniteInterfaceMenu>> INFINITE_INTERFACE =
+            MENUS.register("infinite_interface",
+                    () -> IMenuTypeExtension.create(InfiniteInterfaceMenu::fromNetwork));
 }

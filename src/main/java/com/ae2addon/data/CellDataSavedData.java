@@ -95,8 +95,8 @@ public class CellDataSavedData extends SavedData {
     // ══════════════════════════════════════════════
 
     public static class CellData {
-        /** 无限物品在面板中显示的字节数 — 与合成 CPU 存储量一致 */
-        public static final long INFINITE_BYTES = 300000000;
+        /** 无限物品在面板中显示的字节数（config cellDisplayBytes 热加载） */
+        public static volatile long INFINITE_BYTES = com.ae2addon.config.AE2AddonConfig.cellDisplayBytes();
 
         /** BigInteger 存储，突破 Long.MAX_VALUE 限制 */
         public final Map<AEKey, BigInteger> s1 = new HashMap<>();
@@ -106,6 +106,16 @@ public class CellDataSavedData extends SavedData {
         public final Map<AEKey, Long> ca = new HashMap<>();
         /** Mode 3 已插入的物品（含 NBT 变体），跨存档持久化 */
         public final Set<AEKey> m3 = new HashSet<>();
+        /** Mode 2 按 tag 批量无限（如 "minecraft:logs"） */
+        public final Set<String> tags = new HashSet<>();
+        /** Mode 2 按 mod 批量无限（如 "gtceu"） */
+        public final Set<String> mods = new HashSet<>();
+        /** 规则生效模式：true=立即全量无限，false=触碰（存入过）后无限 */
+        public boolean ruleInstant = true;
+        /** 触碰模式下记录过的匹配物品（存入过才显示无限） */
+        public final Set<AEKey> ruleTouched = new HashSet<>();
+        /** 黑名单：即使命中 tag/mod 规则也禁止无限 */
+        public final Set<AEKey> blacklist = new HashSet<>();
 
         public void save(CompoundTag tag, HolderLookup.Provider registries) {
             putBigIntMap(tag, "s1", s1, registries);
@@ -114,6 +124,11 @@ public class CellDataSavedData extends SavedData {
             putSet(tag, "ul", ul, registries);
             putLongMap(tag, "ca", ca, registries);
             putSet(tag, "m3", m3, registries);
+            putStringSet(tag, "tags", tags);
+            putStringSet(tag, "mods", mods);
+            tag.putBoolean("ri", ruleInstant);
+            putSet(tag, "rt", ruleTouched, registries);
+            putSet(tag, "bl", blacklist, registries);
         }
 
         public static CellData load(CompoundTag tag, HolderLookup.Provider registries) {
@@ -124,6 +139,11 @@ public class CellDataSavedData extends SavedData {
             getSet(tag, "ul", data.ul, registries);
             getLongMap(tag, "ca", data.ca, registries);
             getSet(tag, "m3", data.m3, registries);
+            getStringSet(tag, "tags", data.tags);
+            getStringSet(tag, "mods", data.mods);
+            data.ruleInstant = tag.getBoolean("ri");
+            getSet(tag, "rt", data.ruleTouched, registries);
+            getSet(tag, "bl", data.blacklist, registries);
             return data;
         }
 
@@ -142,6 +162,9 @@ public class CellDataSavedData extends SavedData {
                 if (total < 0) { total = Long.MAX_VALUE; break; }
             }
             long infiniteCount = (long) wl.size() + (long) (ul.size() - countInBoth(wl, ul));
+            // 批量规则：按规则数粗略估算（tags + mods）
+            long ruleCount = (long) tags.size() + (long) mods.size();
+            infiniteCount += ruleCount;
             if (infiniteCount > 0) {
                 long add = infiniteCount * INFINITE_BYTES;
                 total += add;
@@ -152,7 +175,7 @@ public class CellDataSavedData extends SavedData {
 
         public int getTypeCount() {
             // wl ⊆ ul，所以 ul.size() 已经包含了 wl，不重复计数
-            return s1.size() + s2.size() + ul.size();
+            return s1.size() + s2.size() + ul.size() + tags.size() + mods.size();
         }
 
         private static int countInBoth(Set<?> a, Set<?> b) {
@@ -233,6 +256,29 @@ public class CellDataSavedData extends SavedData {
             for (Tag tag : t.getList(k, Tag.TAG_COMPOUND)) {
                 AEKey key = AEKey.fromTagGeneric(registries, (CompoundTag) tag);
                 if (key != null) s.add(key);
+            }
+        }
+
+        /** 写字符串集合（tags / mods 规则） */
+        private static void putStringSet(CompoundTag t, String k, Set<String> s) {
+            ListTag l = new ListTag();
+            for (String v : s) {
+                CompoundTag n = new CompoundTag();
+                n.putString("v", v);
+                l.add(n);
+            }
+            t.put(k, l);
+        }
+
+        /** 读字符串集合 */
+        private static void getStringSet(CompoundTag t, String k, Set<String> s) {
+            s.clear();
+            if (!t.contains(k)) return;
+            for (Tag tag : t.getList(k, Tag.TAG_COMPOUND)) {
+                CompoundTag e = (CompoundTag) tag;
+                if (e.contains("v", Tag.TAG_STRING)) {
+                    s.add(e.getString("v"));
+                }
             }
         }
     }

@@ -1,37 +1,79 @@
 package com.ae2addon.mixin;
 
-import appeng.blockentity.crafting.CraftingBlockEntity;
 import appeng.me.cluster.implementations.CraftingCPUCluster;
-import com.ae2addon.block.InfiniteCoProcessingBE;
+import com.ae2addon.AE2Addon;
+import com.ae2addon.block.IntegratedCPUBE;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Constant;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.ModifyConstant;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
- * 移除 AE2 CraftingCPUCluster 的 16 线程上限。
+ * CraftingCPUCluster 改造（仅对含 {@link IntegratedCPUBE} 的簇生效）：
  * <p>
- * 注意：不修改常量 16。整合包中多个模组（bigger_ae2、extendedae_plus 等）都通过
- * {@code @ModifyConstant} 修改同一个常量，谁先改谁生效，其余模组若配置了
- * {@code defaultRequire=1} 会直接崩溃（如 bigger_ae2）。
- * 为避免抢占该常量，这里改为在 {@code addBlockEntity} 返回后直接把
- * {@code accelerator} 字段置为 {@link Integer#MAX_VALUE}，与任何模组都能共存。
+ * 1. 移除 AE2 的单方块 16 线程上限（addBlockEntity 常量 16 → Integer.MAX_VALUE），
+ *    否则 IntegratedCPUBE 返回的大线程数会抛 IllegalArgumentException。
+ * 2. getAvailableStorage() → Long.MAX_VALUE：无限存储的精确哨兵值。
+ *    CPU 列表 / 合成确认界面 / tooltip 的「∞」显示都依赖它（=Long.MAX_VALUE 判断）。
+ * <p>
+ * 注：旧版 fork 曾用 {@code @Inject(RETURN)} 在 addBlockEntity 返回后把 accelerator
+ * 字段直接置 Integer.MAX_VALUE（避开 ModifyConstant 与 bigger_ae2 等模组抢常量）。
+ * 2026 端口后两个方块已「普通方块化」（BE 不再继承 CraftingBlockEntity），
+ * addBlockEntity 收不到它们，旧注入变为死代码；上游改回 @ModifyConstant(16→MAX_VALUE)
+ * 并以 priority=1200 抢占同一常量，本 MIXIN 即为上游演进版的 NeoForge 1.21.1 移植。
  */
-@Mixin(CraftingCPUCluster.class)
-public abstract class CraftingCPUClusterMixin {
+@Mixin(value = CraftingCPUCluster.class, remap = false, priority = 1200)
+public class CraftingCPUClusterMixin {
 
-    @Shadow
-    private int accelerator;
-
-    @Inject(
+    @ModifyConstant(
             method = "addBlockEntity(Lappeng/blockentity/crafting/CraftingBlockEntity;)V",
-            at = @At("RETURN"),
+            constant = @Constant(intValue = 16),
             remap = false
     )
-    private void ae2addon$setInfiniteAcceleratorThreads(CraftingBlockEntity blockEntity, CallbackInfo ci) {
-        if (blockEntity instanceof InfiniteCoProcessingBE) {
-            this.accelerator = Integer.MAX_VALUE;
+    private int ae2addon$modifyMaxAcceleratorThreads(int original) {
+        return Integer.MAX_VALUE;
+    }
+
+    @Inject(method = "getAvailableStorage", at = @At("HEAD"), cancellable = true, remap = false, require = 0)
+    private void ae2addon$infiniteStorage(CallbackInfoReturnable<Long> callback) {
+        if (!ae2addon$diagLogged) {
+            ae2addon$diagLogged = true;
+            boolean integrated = ae2addon$isIntegratedCpu((CraftingCPUCluster) (Object) this);
+            AE2Addon.LOGGER.info("[ae2addon] getAvailableStorage 注入生效！集成CPU={}", integrated);
         }
+        if (ae2addon$isIntegratedCpu((CraftingCPUCluster) (Object) this)) {
+            callback.setReturnValue(Long.MAX_VALUE);
+        }
+    }
+
+    /**
+     * ⚠️ 2026-08-22 移除（原 done() 自动隐藏虚拟 lane）：
+     * 任务完成即 removeVirtualCpu 导致 lane 刚创建就被移除——单次订单瞬间完成，
+     * 界面永远看不到「线程 1」，量子分裂形同虚设（sensei 实测：主线程被占时
+     * 线程 1 不出现）。改为<b>常驻空闲 lane</b>：lane 完成后保留，由
+     * IntegratedCPUBE.ensureOneIdleCpu 的回收逻辑在「主簇空闲」时才清理
+     * （主簇忙 → 1 个空闲 lane 常驻可见，新订单直接量子分裂并行；
+     * 主簇空闲 → 回收多余空闲 lane）。
+     */
+
+    @Unique
+    private static boolean ae2addon$diagLogged;
+
+    @Unique
+    private static boolean ae2addon$isIntegratedCpu(CraftingCPUCluster cluster) {
+        try {
+            var iterator = cluster.getBlockEntities();
+            while (iterator.hasNext()) {
+                if (iterator.next() instanceof IntegratedCPUBE) {
+                    return true;
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // 簇未成型/结构异常时保守返回 false
+        }
+        return false;
     }
 }

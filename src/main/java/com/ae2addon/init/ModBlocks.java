@@ -3,6 +3,8 @@ package com.ae2addon.init;
 import com.ae2addon.AE2Addon;
 import com.ae2addon.block.InfiniteCraftingStorageBlock;
 import com.ae2addon.block.InfiniteCoProcessingBlock;
+import com.ae2addon.block.InfiniteInterfaceBlock;
+import com.ae2addon.block.IntegratedCPUBlock;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.level.block.Block;
 import net.neoforged.neoforge.registries.DeferredHolder;
@@ -26,5 +28,17 @@ public class ModBlocks {
     public static final DeferredHolder<Block, Block> INFINITE_CO_PROCESSING = BLOCKS.register(
             "infinite_co_processing",
             InfiniteCoProcessingBlock::new
+    );
+
+    /** 集成型CPU（无限级）— 3×5×3 多方块，提供无限合成能力 */
+    public static final DeferredHolder<Block, Block> INTEGRATED_CPU = BLOCKS.register(
+            "integrated_cpu",
+            IntegratedCPUBlock::new
+    );
+
+    /** ME接口（无限级）— 机器供料站 */
+    public static final DeferredHolder<Block, Block> INFINITE_INTERFACE = BLOCKS.register(
+            "infinite_interface",
+            InfiniteInterfaceBlock::new
     );
 }

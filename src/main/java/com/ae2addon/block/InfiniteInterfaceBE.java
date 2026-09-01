@@ -1,0 +1,2584 @@
+package com.ae2addon.block;
+
+import appeng.api.config.Actionable;
+import appeng.api.crafting.IPatternDetails;
+import appeng.api.crafting.PatternDetailsHelper;
+import appeng.api.networking.GridFlags;
+import appeng.api.networking.IGrid;
+import appeng.api.networking.IManagedGridNode;
+import appeng.api.networking.crafting.ICraftingProvider;
+import appeng.api.networking.security.IActionSource;
+import appeng.api.orientation.BlockOrientation;
+import appeng.api.orientation.RelativeSide;
+import appeng.api.stacks.AEFluidKey;
+import appeng.api.stacks.AEItemKey;
+import appeng.api.stacks.AEKey;
+import appeng.api.stacks.KeyCounter;
+import appeng.api.storage.MEStorage;
+import appeng.blockentity.grid.AENetworkedBlockEntity;
+import appeng.me.helpers.MachineSource;
+import com.ae2addon.config.AE2AddonConfig;
+import com.ae2addon.init.ModBlockEntities;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.Tag;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.component.CustomData;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.neoforged.neoforge.capabilities.Capabilities;
+import net.neoforged.neoforge.capabilities.BlockCapability;
+import net.neoforged.neoforge.fluids.FluidStack;
+import net.neoforged.neoforge.fluids.FluidUtil;
+import net.neoforged.neoforge.fluids.capability.IFluidHandler;
+import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
+import net.neoforged.neoforge.items.IItemHandler;
+import org.jetbrains.annotations.Nullable;
+
+import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * ME 接口（无限级）— 机器供料站（被动供料 + CPU 直灌合体）。
+ * <p>
+ * 三个核心能力（2026-08-28 开工，方案来自 08-27 讨论）：
+ * <pre>
+ *   ① 被动拉取：相邻机器/漏斗从正面抽 → 蓄水池无单 tick 上限地从网络补足
+ *                （每 4 tick 一次，每次拉满缺口，不受原版接口 1 操作/槽/tick 限制）
+ *   ② 接收 CPU ScaledPattern N×：实现 ICraftingProvider，pushPattern 无条件收下
+ *                （普通 ME 接口是 ICraftingRequester 收不到推送——这是补的洞）
+ *   ③ 按机器容量分批喂出：每 tick 把蓄水池物品往正面机器 insertItem，
+ *                机器拒收的余量留在蓄水池，天然按机器缓冲上限分批
+ * </pre>
+ * 配置：正面（FACING 朝向）放样板 = 声明可处理的配方，CPU 会把该配方任务推过来；
+ * 同时样板输入 = 自动补货清单（机器消耗后从网络拉回，目标量 config feederStockTarget）。
+ * <p>
+ * 数据流：CPU ──ScaledPattern N×──► [蓄水池 BigInteger] ──insertItem 分批──► 机器
+ *         网络 ──无上限拉取─────────► [蓄水池] ◄──extractItem── 机器/漏斗
+ */
+public class InfiniteInterfaceBE extends AENetworkedBlockEntity
+        implements ICraftingProvider, appeng.helpers.patternprovider.PatternContainer,
+        appeng.api.upgrades.IUpgradeableObject,
+        appeng.api.networking.crafting.ICraftingRequester {
+
+    // ── 全局注册表（供 CPU mixin 查询：全量推送判定 / 取消回退） ──
+
+    private static final java.util.Set<InfiniteInterfaceBE> ACTIVE =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** 当前 CPU 任务推送到本接口的材料归属：CPU簇 → 物品 → 数量。 */
+    private final Map<Object, Map<AEKey, BigInteger>> pushedByCluster = new HashMap<>();
+
+    /**
+     * 是否有同网格的无限接口声明了该样板（CPU mixin 全量推送判定用）。
+     * 只查同网格：避免跨网络误判导致全量推给不相干的 provider 全部拒收卡任务。
+     */
+    public static boolean hasFeederFor(appeng.api.networking.IGrid grid, IPatternDetails pattern) {
+        if (grid == null || pattern == null) {
+            return false;
+        }
+        for (var be : ACTIVE) {
+            if (be.isRemoved()) {
+                continue;
+            }
+            try {
+                if (be.getMainNode().getGrid() != grid) {
+                    continue;
+                }
+                if (be.patterns.contains(pattern)) {
+                    return true;
+                }
+            } catch (RuntimeException ignored) {
+            }
+        }
+        return false;
+    }
+
+    /** CPU 任务取消：所有接口把该簇推送的未喂出材料插回网络。 */
+    public static void returnPushedFor(Object cluster) {
+        if (cluster == null) {
+            return;
+        }
+        for (var be : ACTIVE) {
+            if (be.isRemoved()) {
+                continue;
+            }
+            be.returnPushedForCluster(cluster);
+        }
+    }
+
+    /** 新任务开始：清空该簇的归属记录（材料保留在接口，正常交付语义）。 */
+    public static void resetPushedFor(Object cluster) {
+        if (cluster == null) {
+            return;
+        }
+        for (var be : ACTIVE) {
+            if (be.isRemoved()) {
+                continue;
+            }
+            be.pushedByCluster.remove(cluster);
+        }
+    }
+
+    // ── 配置（AE2AddonConfig.apply 热加载） ──
+
+    /** 每个物品的蓄水池目标保有量（0 = 不自动补货，只收 CPU 推送）。 */
+    public static volatile long STOCK_TARGET = 1_000_000L;
+    /** 每 tick 喂给相邻机器的 insertItem 尝试次数上限（防单 tick 卡顿）。 */
+    public static volatile int FEED_BUDGET = 1024;
+    /** 每次 insertItem 尝试的最大堆叠数（受机器槽位上限约束）。 */
+    public static volatile int FEED_STACK = 64;
+    /** 主动抽取配置（applyConfig 同步）。 */
+    public static volatile int EXTRACT_INTERVAL = 4;
+    public static volatile int EXTRACT_STACK = 64;
+    public static volatile int EXTRACT_FLUID = 1000;
+    public static volatile int EXTRACT_GAS = 1000;
+    /** 补货间隔（tick）。4 = 每秒 5 次全量补货。 */
+    public static volatile int RESTOCK_INTERVAL = 4;
+
+    /** 配置热加载时由 AE2AddonConfig 调用。 */
+    public static void applyConfig() {
+        STOCK_TARGET = AE2AddonConfig.feederStockTarget();
+        FEED_BUDGET = AE2AddonConfig.feederFeedBudget();
+        FEED_STACK = AE2AddonConfig.feederFeedStack();
+        RESTOCK_INTERVAL = Math.max(1, AE2AddonConfig.feederRestockInterval());
+        EXTRACT_INTERVAL = Math.max(1, AE2AddonConfig.feederExtractInterval());
+        EXTRACT_STACK = Math.max(1, AE2AddonConfig.feederExtractStack());
+        EXTRACT_FLUID = Math.max(1, AE2AddonConfig.feederExtractFluid());
+        EXTRACT_GAS = Math.max(1, AE2AddonConfig.feederExtractGas());
+    }
+
+    // ── 蓄水池（BigInteger 防溢出；CPU N× 直灌可达 2^63-1/批） ──
+
+    private final Map<AEKey, BigInteger> reservoir = new LinkedHashMap<>();
+
+    /** 累计已喂出总量（机器/漏斗实际收到的物品数；供料站流量可见性）。 */
+    private BigInteger totalFed = BigInteger.ZERO;
+
+    /** 补货提取失败计数（诊断节流用）。 */
+    private long restockFailCount;
+
+    /** 推送速率统计：当前 1 秒窗口内喂出数 / 上一秒速率（items/s）。 */
+    private long rateWindowFed;
+    private long currentFeedRate;
+
+    /** 拒收统计：整 tick 零喂出（机器满/拒收）的次数窗口 / 上一秒速率。 */
+    private long rejectWindow;
+    private long currentRejectRate;
+
+    // ── 样板槽（3×3，声明可处理的配方；CPU 路由靠它） ──
+
+    private final SimpleContainer patternInv = new SimpleContainer(45) {
+        @Override
+        public void setChanged() {
+            super.setChanged();
+            InfiniteInterfaceBE.this.onPatternsChanged();
+        }
+
+        @Override
+        public boolean canPlaceItem(int index, ItemStack stack) {
+            // 页授权：未插容量卡只有第 1 页（9 格），每张卡 +9 格
+            if (index >= 9 + capacityCards() * 9) {
+                return false;
+            }
+            return appeng.api.crafting.PatternDetailsHelper.isEncodedPattern(stack);
+        }
+    };
+
+    // ── 标记槽（3×3，声明自动补货物品；与样板定量语义解耦） ──
+    // 样板 = 定量（CPU 推多少发多少，发完停）；标记 = 无限供料（标记的物品
+    // 持续从网络补到 feederStockTarget，机器永远有货）。
+
+    private final SimpleContainer markerInv = new SimpleContainer(45) {
+        @Override
+        public void setChanged() {
+            super.setChanged();
+            InfiniteInterfaceBE.this.onMarkersChanged();
+        }
+
+        @Override
+        public boolean canPlaceItem(int index, ItemStack stack) {
+            // 页授权：未插容量卡只有第 1 页（9 格），每张卡 +9 格
+            if (index >= 9 + capacityCards() * 9) {
+                return false;
+            }
+            // 标记槽只收虚拟标记（WGS）：真实物品一律拒绝（拖拽/放入不吞，
+            // 物品留在手上；标记请用左键/右键/JEI 拖取）
+            if (stack.isEmpty()) {
+                return true;
+            }
+            return stack.getItem() instanceof appeng.items.misc.WrappedGenericStack;
+        }
+
+        @Override
+        public void setItem(int index, ItemStack stack) {
+            // 防御（2026-08-28）：任何路径（拖拽/管道/代码）放入真实物品 →
+            // 自动转虚拟标记，绝不吞物品（容器只存 WrappedGenericStack）
+            if (!stack.isEmpty()
+                    && !(stack.getItem() instanceof appeng.items.misc.WrappedGenericStack)) {
+                AEKey key = com.ae2addon.block.InfiniteInterfaceBE.keyOfStack(stack);
+                if (key != null) {
+                    super.setItem(index, appeng.items.misc.WrappedGenericStack.wrap(key, 1));
+                    return;
+                }
+                super.setItem(index, ItemStack.EMPTY);
+                return;
+            }
+            super.setItem(index, stack);
+        }
+    };
+
+    private List<IPatternDetails> patterns = List.of();
+    private boolean patternDirty = false;
+
+    // ── 升级槽（容量卡=双槽各+1行；加速卡=喂出预算×2） ──
+
+    private final appeng.api.upgrades.IUpgradeInventory upgrades =
+            appeng.api.upgrades.UpgradeInventories.forMachine(
+                    com.ae2addon.init.ModBlocks.INFINITE_INTERFACE.get(), 9,
+                    this::onUpgradesChanged);
+
+    /**
+     * 样板管理终端（Pattern Access Terminal）兼容适配器：终端通过 PatternContainer
+     * 发现本方块并远程读写样板槽（2026-08-28 sensei 反馈：此前不实现 PatternContainer
+     * → 终端看不到/管不了我们的样板）。
+     * 写入走 patternInv.setItem → SimpleContainer.setChanged → onPatternsChanged →
+     * requestUpdate，CPU 路由即时刷新。
+     */
+    private final appeng.api.inventories.InternalInventory terminalPatternInv =
+            new appeng.api.inventories.InternalInventory() {
+                @Override
+                public int size() {
+                    // 按容量卡裁剪：无卡 9 格，每张卡 +9 格（终端显示格数）
+                    return activePatternSlots();
+                }
+
+                @Override
+                public ItemStack getStackInSlot(int slot) {
+                    if (slot >= activePatternSlots()) {
+                        return ItemStack.EMPTY;
+                    }
+                    return patternInv.getItem(slot);
+                }
+
+                @Override
+                public void setItemDirect(int slot, ItemStack stack) {
+                    if (slot >= activePatternSlots()) {
+                        return;
+                    }
+                    patternInv.setItem(slot, stack);
+                }
+
+                @Override
+                public int getSlotLimit(int slot) {
+                    return 1;
+                }
+
+                @Override
+                public boolean isItemValid(int slot, ItemStack stack) {
+                    if (slot >= activePatternSlots()) {
+                        return false;
+                    }
+                    return stack.isEmpty() || PatternDetailsHelper.isEncodedPattern(stack);
+                }
+            };
+
+    private final IActionSource actionSource = new MachineSource(this);
+
+    /** 正面 IItemHandler（机器/漏斗从这里抽；insertItem 一律拒收防回流死循环）。 */
+    private final IItemHandler frontHandler =
+            new FrontItemHandler();
+
+    public InfiniteInterfaceBE(BlockPos pos, BlockState state) {
+        super(ModBlockEntities.INFINITE_INTERFACE.get(), pos, state);
+        // 世界加载时触发跨 mod 升级卡懒注册（AppFlux/ExtendedAE+；构造器里注册会崩）
+        com.ae2addon.AE2Addon.ensureCompatUpgrades();
+    }
+
+    // ── 诊断日志（定位供料问题用） ──
+
+    private boolean feederDiagLogged;
+
+    // ── 每接口独立参数（-1 = 用全局配置；内存卡可复制） ──
+
+    /** 独立补货目标（-1=全局）。 */
+    public long pStockTarget = -1;
+
+    /** 独立补货间隔 tick（-1=全局）。 */
+    public int pRestockInterval = -1;
+
+    /** 独立喂出预算（-1=全局）。 */
+    public int pFeedBudget = -1;
+
+    public long stockTargetValue() {
+        return pStockTarget >= 0 ? pStockTarget : com.ae2addon.config.AE2AddonConfig.feederStockTarget();
+    }
+
+    public int restockIntervalValue() {
+        return pRestockInterval > 0 ? pRestockInterval
+                : Math.max(1, com.ae2addon.config.AE2AddonConfig.feederRestockInterval());
+    }
+
+    public int feedBudgetValue() {
+        return pFeedBudget > 0 ? pFeedBudget : com.ae2addon.config.AE2AddonConfig.feederFeedBudget();
+    }
+
+    /** GUI 设置每接口参数（key: stockTarget/restockInterval/feedBudget）。 */
+    public void setPerBlockParam(String key, long value) {
+        switch (key) {
+            case "stockTarget" -> pStockTarget = Math.max(0, Math.min(Long.MAX_VALUE, value));
+            case "restockInterval" -> pRestockInterval = (int) Math.max(0, Math.min(10000, value));
+            case "feedBudget" -> pFeedBudget = (int) Math.max(0, Math.min(1_000_000, value));
+            default -> {
+                return;
+            }
+        }
+        setChanged();
+        com.ae2addon.AE2Addon.LOGGER.info("[ae2addon][feeder] 本接口参数 {} = {}", key, value);
+    }
+
+    // ── 主动输入/输出开关（GUI 内切换；默认全开） ──
+
+    /** 主动抽取（正面机器产物 → 网络）。 */
+    public boolean activeExtract = true;
+
+    /** 主动喂出（蓄水池 → 正面机器）。 */
+    public boolean activeFeed = true;
+
+    /** 标记喂出（标记补货缓存 → 机器；关闭时只喂样板推送材料，2026-08-30 sensei）。 */
+    public boolean activeMarkerFeed = true;
+
+    /** 蓄水池中当前含样板推送材料的 key（标记喂出关闭时只喂这些）。 */
+    private final Set<AEKey> patternKeys = new HashSet<>();
+
+    /** 主动抽取方向（相对面，跟随方块朝向；默认正面保持原行为）。 */
+    public appeng.api.orientation.RelativeSide extractSide = appeng.api.orientation.RelativeSide.FRONT;
+
+    /** 循环切换抽取方向（正→后→左→右→上→下）。 */
+    public void cycleExtractSide() {
+        var all = appeng.api.orientation.RelativeSide.values();
+        int idx = java.util.Arrays.asList(all).indexOf(extractSide);
+        extractSide = all[(idx + 1) % all.length];
+        setChanged();
+        com.ae2addon.AE2Addon.LOGGER.info("[ae2addon][feeder] 主动抽取方向 → {}", extractSide.name());
+    }
+
+    /** 抽取方向的实际世界方向（null = 无法解析）。 */
+    @Nullable
+    public Direction getExtractDir() {
+        BlockState state = getBlockState();
+        if (state == null) {
+            return null;
+        }
+        try {
+            return BlockOrientation.get(state).getSide(extractSide);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** GUI 开关切换。 */
+    public void toggleActive(String which) {
+        if ("extract".equals(which)) {
+            activeExtract = !activeExtract;
+            com.ae2addon.AE2Addon.LOGGER.info("[ae2addon][feeder] 主动抽取 {}", activeExtract ? "开" : "关");
+        } else if ("feed".equals(which)) {
+            activeFeed = !activeFeed;
+            com.ae2addon.AE2Addon.LOGGER.info("[ae2addon][feeder] 主动喂出 {}", activeFeed ? "开" : "关");
+        } else if ("markerFeed".equals(which)) {
+            activeMarkerFeed = !activeMarkerFeed;
+            com.ae2addon.AE2Addon.LOGGER.info("[ae2addon][feeder] 标记喂出 {}", activeMarkerFeed ? "开" : "关");
+        } else if ("dir".equals(which)) {
+            cycleExtractSide();
+            return; // 已在 cycle 内 setChanged
+        }
+        setChanged();
+    }
+
+    // ── 每标记独立缓存目标（中键循环切换；缺省用全局 STOCK_TARGET） ──
+
+    /** 标记 key → 独立补货目标（0 = 用全局配置）。 */
+    private final java.util.Map<AEKey, Long> markerTargets = new java.util.LinkedHashMap<>();
+
+    /** 中键循环档位：1K → 10K → 100K → 1M → MAX → 1K… */
+    private static final long[] TARGET_STEPS = {1_000L, 10_000L, 100_000L, 1_000_000L, Long.MAX_VALUE};
+
+    /** 槽内堆叠 → AEKey（WrappedGenericStack 解包；普通物品转 itemKey）。 */
+    public static AEKey keyOfStack(ItemStack stack) {
+        if (stack == null || stack.isEmpty()) {
+            return null;
+        }
+        if (stack.getItem() instanceof appeng.items.misc.WrappedGenericStack wgs) {
+            return wgs.unwrapWhat(stack);
+        }
+        return appeng.api.stacks.AEItemKey.of(stack);
+    }
+
+    /** 标记的补货目标（标记独立值 > 每接口参数 > 全局）。 */
+    public long targetFor(AEKey key) {
+        Long v = markerTargets.get(key);
+        if (v != null && v > 0) {
+            return v;
+        }
+        return stockTargetValue();
+    }
+
+    /** 中键点击标记槽：循环切换该标记的缓存目标。 */
+    public void cycleMarkerTarget(int markerIndex) {
+        if (markerIndex < 0 || markerIndex >= markerInv.getContainerSize()) {
+            return;
+        }
+        ItemStack stack = markerInv.getItem(markerIndex);
+        if (stack.isEmpty()) {
+            return;
+        }
+        AEKey key = null;
+        if (stack.getItem() instanceof appeng.items.misc.WrappedGenericStack wgs) {
+            key = wgs.unwrapWhat(stack);
+        } else {
+            key = appeng.api.stacks.AEItemKey.of(stack);
+        }
+        if (key == null) {
+            return;
+        }
+        long cur = markerTargets.getOrDefault(key, STOCK_TARGET);
+        long next = TARGET_STEPS[0];
+        for (long step : TARGET_STEPS) {
+            if (cur < step) {
+                next = step;
+                break;
+            }
+        }
+        if (cur >= TARGET_STEPS[TARGET_STEPS.length - 1]) {
+            next = TARGET_STEPS[0];
+        }
+        markerTargets.put(key, next);
+        setChanged();
+        com.ae2addon.AE2Addon.LOGGER.info("[ae2addon][feeder] 标记 {} 缓存目标 → {}",
+                key, next == Long.MAX_VALUE ? "MAX" : next);
+    }
+
+    /** 内存卡导出用：markerTargets 只读快照。 */
+    public java.util.Map<AEKey, Long> markerTargetsSnapshot() {
+        return java.util.Collections.unmodifiableMap(new java.util.LinkedHashMap<>(markerTargets));
+    }
+
+    /** 内存卡导入用：清空独立目标。 */
+    public void markerTargetsClear() {
+        markerTargets.clear();
+    }
+
+    /** 内存卡导入用：写入独立目标。 */
+    public void markerTargetsPut(AEKey key, long target) {
+        markerTargets.put(key, target);
+    }
+
+    /** 中键弹框输入：设置标记槽的独立缓存目标（target<=0 清除独立值回退全局）。 */
+    public void setMarkerTarget(int markerIndex, long target) {
+        if (markerIndex < 0 || markerIndex >= markerInv.getContainerSize()) {
+            return;
+        }
+        ItemStack stack = markerInv.getItem(markerIndex);
+        if (stack.isEmpty()) {
+            return;
+        }
+        AEKey key = null;
+        if (stack.getItem() instanceof appeng.items.misc.WrappedGenericStack wgs) {
+            key = wgs.unwrapWhat(stack);
+        } else {
+            key = appeng.api.stacks.AEItemKey.of(stack);
+        }
+        if (key == null) {
+            return;
+        }
+        if (target <= 0) {
+            markerTargets.remove(key);
+            com.ae2addon.AE2Addon.LOGGER.info("[ae2addon][feeder] 标记 {} 缓存目标 → 全局({})",
+                    key, STOCK_TARGET);
+        } else {
+            markerTargets.put(key, target);
+            com.ae2addon.AE2Addon.LOGGER.info("[ae2addon][feeder] 标记 {} 缓存目标 → {}",
+                    key, target == Long.MAX_VALUE ? "MAX" : target);
+        }
+        setChanged();
+    }
+
+    // ── 虚拟合成卡（CRAFTING_CARD）：补货提取失败且可合成时请求 CPU 合成 ──
+
+    /** key → 上次发起合成请求的 gameTime（防重复请求节流）。 */
+    private final java.util.Map<AEKey, Long> craftingRequests = new java.util.HashMap<>();
+
+    /** 同 key 合成请求冷却（tick；5 秒）。 */
+    private static final long CRAFT_COOLDOWN = 100;
+
+    private void logFeederStatus(String tag) {
+        Direction front = getFront();
+        Direction facing = null;
+        try {
+            facing = getBlockState().getValue(
+                    net.minecraft.world.level.block.state.properties.BlockStateProperties.FACING);
+        } catch (RuntimeException ignored) {
+        }
+        BlockEntity target = (front == null || level == null)
+                ? null : level.getBlockEntity(worldPosition.relative(front));
+        String targetName = target == null
+                ? "无" : target.getBlockState().getBlock().getName().getString();
+        var summary = reservoirSummary();
+        // 蓄水池构成明细（物品/流体/气体/其他）
+        int items = 0, fluids = 0, gases = 0, others = 0;
+        for (var entry : reservoir.entrySet()) {
+            if (entry.getValue().signum() <= 0) {
+                continue;
+            }
+            if (entry.getKey() instanceof AEItemKey) {
+                items++;
+            } else if (entry.getKey() instanceof AEFluidKey) {
+                fluids++;
+            } else if (com.ae2addon.compat.MekanismGasCompat.isFeedable(entry.getKey())) {
+                gases++;
+            } else {
+                others++;
+            }
+        }
+        com.ae2addon.AE2Addon.LOGGER.info(
+                "[ae2addon][feeder] {} pos={} facing={} front={} 目标方块={} 蓄水池={}种"
+                        + "（物品{} 流体{} 气体{} 其他{}）/合计{}",
+                tag, worldPosition, facing, front, targetName, summary[0],
+                items, fluids, gases, others, summary[1]);
+    }
+
+    @Override
+    public void onReady() {
+        super.onReady();
+        ACTIVE.add(this);
+    }
+
+    @Override
+    public void onChunkUnloaded() {
+        ACTIVE.remove(this);
+        disconnectChannelLink();
+        super.onChunkUnloaded();
+    }
+
+    @Override
+    public void setRemoved() {
+        ACTIVE.remove(this);
+        disconnectChannelLink();
+        super.setRemoved();
+    }
+
+    // ── 网格节点：注册为合成 provider（CPU 才能找到我们推样板） ──
+
+    @Override
+    protected IManagedGridNode createMainNode() {
+        return super.createMainNode()
+                .setFlags(GridFlags.REQUIRE_CHANNEL)
+                .addService(ICraftingProvider.class, this);
+    }
+
+    // ── ICraftingProvider：无条件接收 N× ──
+
+    @Override
+    public List<IPatternDetails> getAvailablePatterns() {
+        return patterns;
+    }
+
+    /**
+     * 无条件收下 CPU 推送的样板输入（含 ScaledPattern N× 缩放后的 KeyCounter）。
+     * 输入全部进蓄水池，CPU 推完即走，不阻塞。
+     */
+    @Override
+    public boolean pushPattern(IPatternDetails patternDetails, KeyCounter[] inputs) {
+        long inputCount = 0;
+        long inputTypes = 0;
+        Object pusher = com.ae2addon.crafting.CraftingCompat.currentPushingCluster;
+        Map<AEKey, BigInteger> perCluster = null;
+        if (pusher != null) {
+            perCluster = pushedByCluster.computeIfAbsent(pusher, k -> new HashMap<>());
+        }
+        if (inputs != null) {
+            for (var counter : inputs) {
+                if (counter == null) {
+                    continue;
+                }
+                for (var entry : counter) {
+                    AEKey key = entry.getKey();
+                    long amount = entry.getLongValue();
+                    if (key != null && amount > 0) {
+                        addReservoir(key, BigInteger.valueOf(amount));
+                        patternKeys.add(key);
+                        inputCount += amount;
+                        inputTypes++;
+                        if (perCluster != null) {
+                            perCluster.merge(key, BigInteger.valueOf(amount), BigInteger::add);
+                        }
+                    }
+                }
+            }
+        }
+        var summary = reservoirSummary();
+        com.ae2addon.AE2Addon.LOGGER.info(
+                "[ae2addon][feeder] pushPattern 接收 pattern={} 本次{}种/{}个 → 蓄水池={}种/合计{}（推送源={}）",
+                patternDetails == null ? "null" : patternDetails.getClass().getSimpleName(),
+                inputTypes, inputCount, summary[0], summary[1],
+                pusher == null ? "外部/未知" : pusher.getClass().getSimpleName());
+        setChanged();
+        return true;
+    }
+
+    /** 取消回退：把指定 CPU 簇推送、尚未喂出的材料插回网络。 */
+    private void returnPushedForCluster(Object cluster) {
+        Map<AEKey, BigInteger> pushed = pushedByCluster.remove(cluster);
+        if (pushed == null || pushed.isEmpty()) {
+            return;
+        }
+        appeng.api.networking.IGrid grid = getMainNode().getGrid();
+        appeng.api.storage.MEStorage storage = grid == null
+                ? null : grid.getStorageService().getInventory();
+        BigInteger returned = BigInteger.ZERO;
+        for (var entry : pushed.entrySet()) {
+            AEKey key = entry.getKey();
+            long have = reservoirAmount(key);
+            long back = entry.getValue()
+                    .min(BigInteger.valueOf(have))
+                    .min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+            if (back <= 0) {
+                continue;
+            }
+            if (storage != null) {
+                long inserted = storage.insert(key, back, Actionable.MODULATE, actionSource);
+                if (inserted > 0) {
+                    subtractReservoir(key, inserted);
+                    returned = returned.add(BigInteger.valueOf(inserted));
+                }
+            } else {
+                subtractReservoir(key, back);
+                returned = returned.add(BigInteger.valueOf(back));
+            }
+        }
+        if (returned.signum() > 0) {
+            setChanged();
+            com.ae2addon.AE2Addon.LOGGER.info(
+                    "[ae2addon][feeder] CPU任务取消，材料回退网络 {} 个（{}种），剩余蓄水池={}种/合计{}",
+                    fmt(returned), pushed.size(), reservoirSummary()[0],
+                    fmt(totalAmount()));
+        }
+    }
+
+    /** 永不拒收（蓄水池无限）。 */
+    @Override
+    public boolean isBusy() {
+        return false;
+    }
+
+    // ── 升级（IUpgradeableObject） ──
+
+    @Override
+    public appeng.api.upgrades.IUpgradeInventory getUpgrades() {
+        return upgrades;
+    }
+
+    // ── 网络入口（2026-08-28 sensei：接口当然要有入口）──
+    // 非正面暴露物品/流体能力：外界（管道/漏斗/其他 mod）塞进来的东西直接进网络。
+    // 正面保持喂机器。抽走暂不支持（虚拟槽不可见；要抽从网络其他口抽）。
+
+    private final net.neoforged.neoforge.items.IItemHandler networkItemHandler =
+            new net.neoforged.neoforge.items.IItemHandler() {
+                @Override
+                public int getSlots() {
+                    return 1;
+                }
+
+                @Override
+                public net.minecraft.world.item.ItemStack getStackInSlot(int slot) {
+                    if (slot != 0) {
+                        return net.minecraft.world.item.ItemStack.EMPTY;
+                    }
+                    // 蓄水池最多物品预览（显示真实数量；抽取仍按 FEED_STACK 分批）
+                    var best = largestItem();
+                    if (best == null || !(best.getKey() instanceof AEItemKey itemKey)) {
+                        return net.minecraft.world.item.ItemStack.EMPTY;
+                    }
+                    long amount = best.getValue()
+                            .min(BigInteger.valueOf(Integer.MAX_VALUE)).longValue();
+                    return itemKey.toStack((int) Math.max(1, amount));
+                }
+
+                @Override
+                public net.minecraft.world.item.ItemStack insertItem(int slot,
+                        net.minecraft.world.item.ItemStack stack, boolean simulate) {
+                    if (stack.isEmpty()) {
+                        return net.minecraft.world.item.ItemStack.EMPTY;
+                    }
+                    IGrid grid = getMainNode().getGrid();
+                    if (grid == null) {
+                        return stack;
+                    }
+                    try {
+                        var key = appeng.api.stacks.AEItemKey.of(stack);
+                        if (key == null) {
+                            return stack;
+                        }
+                        long inserted = grid.getStorageService().getInventory().insert(
+                                key, stack.getCount(),
+                                simulate ? Actionable.SIMULATE : Actionable.MODULATE,
+                                actionSource);
+                        if (inserted <= 0) {
+                            return stack;
+                        }
+                        if (inserted >= stack.getCount()) {
+                            return net.minecraft.world.item.ItemStack.EMPTY;
+                        }
+                        net.minecraft.world.item.ItemStack rest = stack.copy();
+                        rest.setCount(stack.getCount() - (int) inserted);
+                        return rest;
+                    } catch (RuntimeException e) {
+                        return stack;
+                    }
+                }
+
+                @Override
+                public net.minecraft.world.item.ItemStack extractItem(int slot, int amount,
+                        boolean simulate) {
+                    // 从蓄水池抽取（与正面一致；管道/漏斗可从侧面抽缓存）
+                    if (slot != 0 || amount <= 0) {
+                        return net.minecraft.world.item.ItemStack.EMPTY;
+                    }
+                    var best = largestItem();
+                    if (best == null || !(best.getKey() instanceof AEItemKey itemKey)) {
+                        return net.minecraft.world.item.ItemStack.EMPTY;
+                    }
+                    long take = best.getValue()
+                            .min(BigInteger.valueOf(amount)).min(BigInteger.valueOf(FEED_STACK))
+                            .longValue();
+                    if (take <= 0) {
+                        return net.minecraft.world.item.ItemStack.EMPTY;
+                    }
+                    if (!simulate) {
+                        subtractReservoir(itemKey, take);
+                        totalFed = totalFed.add(BigInteger.valueOf(take));
+                        setChanged();
+                    }
+                    return itemKey.toStack((int) take);
+                }
+
+                @Override
+                public int getSlotLimit(int slot) {
+                    // 反映真实缓存上限（补货目标），Jade/管道显示不误导
+                    return (int) Math.min(Math.max(STOCK_TARGET, 1), Integer.MAX_VALUE);
+                }
+
+                @Override
+                public boolean isItemValid(int slot, net.minecraft.world.item.ItemStack stack) {
+                    return !stack.isEmpty();
+                }
+            };
+
+    private final net.neoforged.neoforge.fluids.capability.IFluidHandler networkFluidHandler =
+            new net.neoforged.neoforge.fluids.capability.IFluidHandler() {
+                @Override
+                public int getTanks() {
+                    return 1;
+                }
+
+                @Override
+                public net.neoforged.neoforge.fluids.FluidStack getFluidInTank(int tank) {
+                    if (tank != 0) {
+                        return net.neoforged.neoforge.fluids.FluidStack.EMPTY;
+                    }
+                    // 蓄水池最多流体预览（Jade/管道能看到真实流体与数量）
+                    var best = largestFluid();
+                    if (best == null) {
+                        return net.neoforged.neoforge.fluids.FluidStack.EMPTY;
+                    }
+                    long amount = best.getValue()
+                            .min(BigInteger.valueOf(Integer.MAX_VALUE)).longValue();
+                    return new net.neoforged.neoforge.fluids.FluidStack(
+                            ((appeng.api.stacks.AEFluidKey) best.getKey()).getFluid(),
+                            (int) Math.max(1, amount));
+                }
+
+                @Override
+                public int getTankCapacity(int tank) {
+                    return Integer.MAX_VALUE;
+                }
+
+                @Override
+                public boolean isFluidValid(int tank, net.neoforged.neoforge.fluids.FluidStack stack) {
+                    return !stack.isEmpty();
+                }
+
+                @Override
+                public int fill(net.neoforged.neoforge.fluids.FluidStack resource,
+                        net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction action) {
+                    if (resource.isEmpty()) {
+                        return 0;
+                    }
+                    IGrid grid = getMainNode().getGrid();
+                    if (grid == null) {
+                        return 0;
+                    }
+                    try {
+                        var key = appeng.api.stacks.AEFluidKey.of(resource.getFluid());
+                        long inserted = grid.getStorageService().getInventory().insert(
+                                key, resource.getAmount(),
+                                action.simulate() ? Actionable.SIMULATE : Actionable.MODULATE,
+                                actionSource);
+                        return (int) inserted;
+                    } catch (RuntimeException e) {
+                        return 0;
+                    }
+                }
+
+                @Override
+                public net.neoforged.neoforge.fluids.FluidStack drain(
+                        net.neoforged.neoforge.fluids.FluidStack resource,
+                        net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction action) {
+                    if (resource.isEmpty()) {
+                        return net.neoforged.neoforge.fluids.FluidStack.EMPTY;
+                    }
+                    // 从蓄水池扣对应流体（管道从侧面抽流体缓存）
+                    var key = appeng.api.stacks.AEFluidKey.of(resource.getFluid());
+                    if (key == null) {
+                        return net.neoforged.neoforge.fluids.FluidStack.EMPTY;
+                    }
+                    long have = reservoirAmount(key);
+                    long take = Math.min(have, resource.getAmount());
+                    if (take <= 0) {
+                        return net.neoforged.neoforge.fluids.FluidStack.EMPTY;
+                    }
+                    if (!action.simulate()) {
+                        subtractReservoir(key, take);
+                        setChanged();
+                    }
+                    return new net.neoforged.neoforge.fluids.FluidStack(resource.getFluid(), (int) take);
+                }
+
+                @Override
+                public net.neoforged.neoforge.fluids.FluidStack drain(int maxDrain,
+                        net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction action) {
+                    if (maxDrain <= 0) {
+                        return net.neoforged.neoforge.fluids.FluidStack.EMPTY;
+                    }
+                    // 蓄水池最多流体（管道无指定时的通用抽取）
+                    var best = largestFluid();
+                    if (best == null) {
+                        return net.neoforged.neoforge.fluids.FluidStack.EMPTY;
+                    }
+                    long take = Math.min(best.getValue().longValue(), maxDrain);
+                    if (take <= 0) {
+                        return net.neoforged.neoforge.fluids.FluidStack.EMPTY;
+                    }
+                    if (!action.simulate()) {
+                        subtractReservoir(best.getKey(), take);
+                        setChanged();
+                    }
+                    return new net.neoforged.neoforge.fluids.FluidStack(
+                            ((appeng.api.stacks.AEFluidKey) best.getKey()).getFluid(), (int) take);
+                }
+            };
+
+    /** 蓄水池中数量最多的流体（侧面抽取预览/通用抽取用）。 */
+    private Map.Entry<AEKey, BigInteger> largestFluid() {
+        Map.Entry<AEKey, BigInteger> best = null;
+        for (var entry : reservoir.entrySet()) {
+            if (!(entry.getKey() instanceof appeng.api.stacks.AEFluidKey)
+                    || entry.getValue().signum() <= 0) {
+                continue;
+            }
+            if (best == null || entry.getValue().compareTo(best.getValue()) > 0) {
+                best = entry;
+            }
+        }
+        return best;
+    }
+
+
+
+    /** 容量卡数量（0-2）：每张样板槽+标记槽各加一行（3格）。 */
+    public int capacityCards() {
+        return upgrades.getInstalledUpgrades(
+                appeng.core.definitions.AEItems.CAPACITY_CARD.asItem());
+    }
+
+    /** 速度卡数量（0-2）：每张喂出预算 ×2。 */
+    /** 当前活动的样板槽数（9 + 容量卡×9，分页显示）。 */
+    public int activePatternSlots() {
+        return 9 + capacityCards() * 9;
+    }
+
+    /** 当前活动的标记槽数（9 + 容量卡×9，分页显示）。 */
+    public int activeMarkerSlots() {
+        return 9 + capacityCards() * 9;
+    }
+
+    /** 最大页数（0 基）：容量卡数（基础页 + 每卡一页）。 */
+    public int maxPage() {
+        return capacityCards();
+    }
+
+    /** 感应卡（红石门控喂出）。 */
+    public boolean hasRedstoneCard() {
+        return upgrades.getInstalledUpgrades(
+                appeng.core.definitions.AEItems.REDSTONE_CARD.asItem()) > 0;
+    }
+
+    /** 反向卡（反转红石信号；无感应卡时无效）。 */
+    public boolean hasInverterCard() {
+        return upgrades.getInstalledUpgrades(
+                appeng.core.definitions.AEItems.INVERTER_CARD.asItem()) > 0;
+    }
+
+    /** 虚拟合成卡（补货不足时请求合成，待实现）。 */
+    public boolean hasCraftingCard() {
+        return upgrades.getInstalledUpgrades(
+                appeng.core.definitions.AEItems.CRAFTING_CARD.asItem()) > 0;
+    }
+
+    /** ICraftingSimulationRequester：合成模拟请求的来源。 */
+    public appeng.api.networking.security.IActionSource getActionSource() {
+        return actionSource;
+    }
+
+    /** AppFlux 感应卡（给机器供电）。 */
+    public boolean hasInductionCard() {
+        var card = com.ae2addon.compat.AppFluxPowerCompat.inductionCard();
+        return card != null && upgrades.getInstalledUpgrades(card) > 0;
+    }
+
+    /** ExtendedAE+ 频道卡（无线连网）。 */
+    public boolean hasChannelCard() {
+        var card = com.ae2addon.compat.ExtendedAEPlusCompat.channelCard();
+        return card != null && upgrades.getInstalledUpgrades(card) > 0;
+    }
+
+    /** ExtendedAE+ 虚拟合成卡（最后一次发配即完成）。 */
+    public boolean hasVirtualCraftingCard() {
+        var card = com.ae2addon.compat.ExtendedAEPlusCompat.virtualCraftingCard();
+        return card != null && upgrades.getInstalledUpgrades(card) > 0;
+    }
+
+    // ── 频道卡无线链路（ExtendedAE+，惰性持有——缺依赖不崩类加载） ──
+
+    /** 无线从端链路持有者（内部 Object 惰性持有 WirelessSlaveLink）。 */
+    private final com.ae2addon.compat.ExtendedAEPlusCompat.ChannelLink channelLink =
+            new com.ae2addon.compat.ExtendedAEPlusCompat.ChannelLink();
+
+    private void updateChannelLink() {
+        var card = com.ae2addon.compat.ExtendedAEPlusCompat.channelCard();
+        net.minecraft.world.item.ItemStack cardStack = net.minecraft.world.item.ItemStack.EMPTY;
+        if (card != null) {
+            for (int i = 0; i < upgrades.size(); i++) {
+                var stack = upgrades.getStackInSlot(i);
+                if (stack.getItem() == card) {
+                    cardStack = stack;
+                    break;
+                }
+            }
+        }
+        channelLink.update(this, cardStack);
+    }
+
+    private void disconnectChannelLink() {
+        channelLink.unload();
+    }
+
+    /** 红石门控：感应卡安装时，信号高=喂出（反向卡则反转）。 */
+    private boolean redstoneAllowsFeed() {
+        if (!hasRedstoneCard()) {
+            return true;
+        }
+        boolean powered = level != null && level.hasNeighborSignal(worldPosition);
+        return hasInverterCard() ? !powered : powered;
+    }
+
+    private void onUpgradesChanged() {
+        // 容量卡强制上限 4（双保险；容器过滤失效时兜底）
+        var capCard = appeng.core.definitions.AEItems.CAPACITY_CARD.asItem();
+        if (upgrades.getInstalledUpgrades(capCard) > 4) {
+            for (int i = 0; i < upgrades.size(); i++) {
+                if (upgrades.getStackInSlot(i).getItem() == capCard) {
+                    upgrades.setItemDirect(i, net.minecraft.world.item.ItemStack.EMPTY);
+                    break;
+                }
+            }
+        }
+        setChanged();
+        updateChannelLink();
+        dumpUpgradeCards(); // 插拔卡立即打日志（不再等 64 tick 门控）
+    }
+
+    /** 升级卡诊断（每 64 tick 或升级变化时打一次）。 */
+    private void dumpUpgradeCards() {
+        com.ae2addon.AE2Addon.ensureCompatUpgrades(); // 幂等补注册（BE 构造失败时重试）
+        try {
+            var block = com.ae2addon.init.ModBlocks.INFINITE_INTERFACE.get();
+            var cap = appeng.core.definitions.AEItems.CAPACITY_CARD.asItem();
+            var blockItem = block.asItem();
+            com.ae2addon.AE2Addon.LOGGER.info(
+                    "[ae2addon][cards] 注册表诊断: block.asItem={} max(blockItem)={} max(AIR)={} max(block)={}",
+                    blockItem,
+                    appeng.api.upgrades.Upgrades.getMaxInstallable(cap, blockItem),
+                    appeng.api.upgrades.Upgrades.getMaxInstallable(cap, net.minecraft.world.item.Items.AIR),
+                    appeng.api.upgrades.Upgrades.getMaxInstallable(cap, net.minecraft.world.item.Item.byBlock(block)));
+        } catch (RuntimeException e) {
+            com.ae2addon.AE2Addon.LOGGER.warn("[ae2addon][cards] 注册表诊断失败", e);
+        }
+        try {
+            java.util.List<String> contents = new java.util.ArrayList<>();
+            for (int i = 0; i < upgrades.size(); i++) {
+                contents.add(upgrades.getStackInSlot(i).getItem().toString());
+            }
+            com.ae2addon.AE2Addon.LOGGER.info(
+                    "[ae2addon][cards] 容量={} 红石={} 反向={} 合成={} 感应={} 频道={} 虚拟={} | 总页={} | 槽: {}",
+                    upgrades.getInstalledUpgrades(appeng.core.definitions.AEItems.CAPACITY_CARD.asItem()),
+                    upgrades.getInstalledUpgrades(appeng.core.definitions.AEItems.REDSTONE_CARD.asItem()),
+                    upgrades.getInstalledUpgrades(appeng.core.definitions.AEItems.INVERTER_CARD.asItem()),
+                    upgrades.getInstalledUpgrades(appeng.core.definitions.AEItems.CRAFTING_CARD.asItem()),
+                    hasInductionCard() ? 1 : 0,
+                    hasChannelCard() ? 1 : 0,
+                    hasVirtualCraftingCard() ? 1 : 0,
+                    maxPage() + 1,
+                    contents);
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    // ── PatternContainer（样板管理终端兼容） ──
+
+    @Override
+    public appeng.api.networking.IGrid getGrid() {
+        return getMainNode().getGrid();
+    }
+
+    @Override
+    public appeng.api.inventories.InternalInventory getTerminalPatternInventory() {
+        return terminalPatternInv;
+    }
+
+    @Override
+    public appeng.api.implementations.blockentities.PatternContainerGroup getTerminalGroup() {
+        // 优先显示正面贴着的机器（2026-08-28 sensei 要求）
+        Direction front = getFront();
+        if (front != null && level != null) {
+            var machine = level.getBlockEntity(worldPosition.relative(front));
+            if (machine != null) {
+                // ICraftingMachine 机器（ExtendedAE 等）→ 官方信息；否则取方块图标+名称
+                var group = appeng.api.implementations.blockentities.PatternContainerGroup
+                        .fromMachine(level, machine.getBlockPos(), front.getOpposite());
+                if (group != null) {
+                    return group;
+                }
+                net.minecraft.world.level.block.Block machineBlock =
+                        machine.getBlockState().getBlock();
+                return new appeng.api.implementations.blockentities.PatternContainerGroup(
+                        appeng.api.stacks.AEItemKey.of(machineBlock),
+                        machineBlock.getName(),
+                        java.util.List.of());
+            }
+        }
+        // 兜底：本方块
+        return new appeng.api.implementations.blockentities.PatternContainerGroup(
+                appeng.api.stacks.AEItemKey.of(com.ae2addon.init.ModBlocks.INFINITE_INTERFACE.get()),
+                net.minecraft.network.chat.Component.translatable(
+                        getBlockState().getBlock().getDescriptionId()),
+                java.util.List.of());
+    }
+
+    /**
+     * 2026-08-29 修复：删除了 getEmitableItems 重写——把样板输出声明为「可发射物品」
+     * 会导致 CraftingTreeNode.canEmit=true，下单时节点直接发射成品而不走样板
+     * （计划 used[]/patternTimes[]/emitted[成品]，即 sensei 遇到的「用成品合成成品」）。
+     * 原版 PatternProviderLogic 不重写此方法（默认空集），保持同行为。
+     */
+
+    // ── 每 tick：补货 + 喂出 ──
+
+    public void serverTick() {
+        Level lvl = level;
+        if (lvl == null || lvl.isClientSide) {
+            return;
+        }
+        if (patternDirty) {
+            rebuildPatterns();
+        }
+        if ((lvl.getGameTime() & 0x3F) == 0 && hasChannelCard()) {
+            updateChannelLink(); // 每 3 秒刷新无线链路（主端变动/延迟连接）
+        }
+        if ((lvl.getGameTime() & 19) == 0) {
+            currentFeedRate = rateWindowFed;
+            rateWindowFed = 0;
+            currentRejectRate = rejectWindow;
+            rejectWindow = 0;
+        }
+        if (!feederDiagLogged) {
+            feederDiagLogged = true;
+            logFeederStatus("启动");
+        } else if ((lvl.getGameTime() & 0x3F) == 0
+                && com.ae2addon.config.AE2AddonConfig.debugLogs()) {
+            logFeederStatus("心跳"); // 每 64 tick（约 3 秒）一条，仅 debugLogs 开
+        }
+        if ((lvl.getGameTime() % restockIntervalValue()) == 0) {
+            restockFromNetwork();
+        }
+        if ((lvl.getGameTime() % EXTRACT_INTERVAL) == 0) {
+            extractFromMachine(); // 主动抽取：可配置方向/间隔（默认每 4 tick）
+        }
+        feedMachinePower(); // 感应卡供电独立于喂出（蓄水池空也供电）
+        feedMachine();
+    }
+
+    /** ① 从网络无上限拉取：对每个待补物品一次拉满缺口（每 RESTOCK_INTERVAL tick）。 */
+    private void restockFromNetwork() {
+        cleanupStrayItems(); // 标记槽误存的真实物品退回网络（防吞材料）
+        if (stockTargetValue() <= 0) {
+            return; // 配置关闭自动补货
+        }
+        IGrid grid = getMainNode().getGrid();
+        if (grid == null) {
+            return;
+        }
+        MEStorage storage = grid.getStorageService().getInventory();
+        for (AEKey key : wantedKeys()) {
+            long have = reservoirAmount(key);
+            long target = targetFor(key);
+            long want = target - have;
+            if (want < 0) {
+                // 目标调小：超出部分退回网络（只补不减 bug 修复）
+                long excess = -want;
+                try {
+                    long back = storage.insert(key, excess, Actionable.MODULATE, actionSource);
+                    if (back > 0) {
+                        subtractReservoir(key, back);
+                        setChanged();
+                        com.ae2addon.AE2Addon.LOGGER.info(
+                                "[ae2addon][feeder] 目标调小，退回 {} x{}（新目标 {}）",
+                                key, back, target);
+                    }
+                } catch (RuntimeException e) {
+                    com.ae2addon.AE2Addon.LOGGER.warn(
+                            "[ae2addon][feeder] 退回失败 {} {}", key, e);
+                }
+                continue;
+            }
+            if (want == 0) {
+                continue;
+            }
+            long got = storage.extract(key, want, Actionable.MODULATE, actionSource);
+            if (got > 0) {
+                addReservoir(key, BigInteger.valueOf(got));
+                setChanged();
+            } else if (hasCraftingCard() && isCraftable(key)) {
+                // 虚拟合成卡：网络没有 → 请求 CPU 合成
+                requestCrafting(key, want);
+            } else if (key instanceof AEFluidKey
+                    || com.ae2addon.compat.MekanismGasCompat.isFeedable(key)) {
+                // 流体/气体提取失败诊断（节流：每 100 次打一条）
+                if ((++restockFailCount & 99) == 0) {
+                    com.ae2addon.AE2Addon.LOGGER.warn(
+                            "[ae2addon][feeder] 补货提取失败: key={} 想要={} 网络无该流体/气体？",
+                            key, want);
+                }
+            }
+        }
+    }
+
+    /** 网络是否可合成该 key（虚拟合成卡）。 */
+    private boolean isCraftable(AEKey key) {
+        IGrid grid = getMainNode().getGrid();
+        if (grid == null) {
+            return false;
+        }
+        try {
+            return grid.getCraftingService().isCraftable(key);
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** 发起 CPU 合成请求（异步；AE2-VM 兼容——beginCraftingCalculation 由 VM 接管）。 */
+    private void requestCrafting(AEKey key, long amount) {
+        IGrid grid = getMainNode().getGrid();
+        if (grid == null || level == null || level.isClientSide) {
+            return;
+        }
+        long now = level.getGameTime();
+        Long last = craftingRequests.get(key);
+        if (last != null && now - last < CRAFT_COOLDOWN) {
+            return; // 冷却中，防刷屏
+        }
+        craftingRequests.put(key, now);
+        try {
+            var service = grid.getCraftingService();
+            // 匿名模拟请求者（BE 不能 implements：getGridNode default 与父类冲突）
+            var simulationRequester = new appeng.api.networking.crafting.ICraftingSimulationRequester() {
+                @Override
+                public appeng.api.networking.security.IActionSource getActionSource() {
+                    return actionSource;
+                }
+            };
+            java.util.concurrent.Future<appeng.api.networking.crafting.ICraftingPlan> future =
+                    service.beginCraftingCalculation(level, simulationRequester, key, amount,
+                            appeng.api.networking.crafting.CalculationStrategy.CRAFT_LESS);
+            // Future（非 CompletableFuture）：后台线程等待计算结果，完成后切主线程提交
+            java.util.concurrent.CompletableFuture
+                    .supplyAsync(() -> {
+                        try {
+                            return future.get(15, java.util.concurrent.TimeUnit.SECONDS);
+                        } catch (Exception e) {
+                            com.ae2addon.AE2Addon.LOGGER.warn(
+                                    "[ae2addon][feeder] 虚拟合成计算失败: {} {}", key, e);
+                            return null;
+                        }
+                    })
+                    .thenAccept(plan -> {
+                        if (plan == null || plan.simulation() || plan.bytes() <= 0) {
+                            return;
+                        }
+                        if (level != null && level.getServer() != null) {
+                            level.getServer().execute(() -> {
+                                try {
+                                    var result = service.submitJob(plan, this, null, false, actionSource);
+                                    if (result != null && result.successful()) {
+                                        com.ae2addon.AE2Addon.LOGGER.info(
+                                                "[ae2addon][feeder] 虚拟合成卡: 提交合成 {} x{}",
+                                                key, plan.bytes());
+                                    } else {
+                                        com.ae2addon.AE2Addon.LOGGER.warn(
+                                                "[ae2addon][feeder] 虚拟合成卡提交未成功: {} 错误={}",
+                                                key, result == null ? "null" : result.errorCode());
+                                    }
+                                } catch (RuntimeException e) {
+                                    com.ae2addon.AE2Addon.LOGGER.warn(
+                                            "[ae2addon][feeder] 虚拟合成卡提交失败: {} {}", key, e);
+                                }
+                            });
+                        }
+                    });
+        } catch (RuntimeException e) {
+            craftingRequests.remove(key);
+            com.ae2addon.AE2Addon.LOGGER.warn(
+                    "[ae2addon][feeder] 虚拟合成请求异常: {} {}", key, e);
+        }
+    }
+
+    // ── ICraftingRequester（虚拟合成卡：CPU 产物直接进蓄水池） ──
+
+    @Override
+    public com.google.common.collect.ImmutableSet<appeng.api.networking.crafting.ICraftingLink> getRequestedJobs() {
+        return com.google.common.collect.ImmutableSet.of();
+    }
+
+    @Override
+    public long insertCraftedItems(appeng.api.networking.crafting.ICraftingLink link,
+            AEKey what, long amount, appeng.api.config.Actionable actionable) {
+        if (actionable == appeng.api.config.Actionable.MODULATE && amount > 0) {
+            addReservoir(what, BigInteger.valueOf(amount));
+            setChanged();
+        }
+        return amount; // 全收（进蓄水池，随后按机器容量喂出）
+    }
+
+    @Override
+    public void jobStateChange(appeng.api.networking.crafting.ICraftingLink link) {
+        // 合成结束/取消：清冷却，允许稍后重试
+        if (link != null && link.getCraftingID() != null) {
+            craftingRequests.entrySet().removeIf(e ->
+                    e.getKey().toString().equals(link.getCraftingID().toString()));
+        } else {
+            craftingRequests.clear();
+        }
+    }
+
+    /**
+     * 清理标记槽里的真实物品（非 WrappedGenericStack）：shift 快捷移动曾绕过
+     * 虚拟化拦截直接写入容器导致材料被吞（2026-08-28 BUG）。
+     * 检测到 → 退回网络 + 清空槽；纯标记（WGS）不受影响。
+     */
+    private void cleanupStrayItems() {
+        IGrid grid = getMainNode().getGrid();
+        if (grid == null) {
+            return;
+        }
+        MEStorage storage = grid.getStorageService().getInventory();
+        boolean changed = false;
+        for (int i = 0; i < markerInv.getContainerSize(); i++) {
+            ItemStack stack = markerInv.getItem(i);
+            if (stack.isEmpty() || stack.getItem() instanceof appeng.items.misc.WrappedGenericStack) {
+                continue;
+            }
+            // 真实物品：退回网络
+            AEItemKey key = AEItemKey.of(stack);
+            if (key != null) {
+                long inserted = storage.insert(key, stack.getCount(),
+                        Actionable.MODULATE, actionSource);
+                com.ae2addon.AE2Addon.LOGGER.warn(
+                        "[ae2addon][feeder] 清理标记槽误存物品: {} x{} 已退回网络",
+                        key, inserted);
+            }
+            markerInv.setItem(i, ItemStack.EMPTY);
+            changed = true;
+        }
+        if (changed) {
+            setChanged();
+        }
+    }
+
+    /** 待补物品 = 标记槽物品（样板输入不再自动补货——定量语义）。 */
+    private Set<AEKey> wantedKeys() {
+        Set<AEKey> keys = new HashSet<>();
+        for (int i = 0; i < markerInv.getContainerSize(); i++) {
+            ItemStack stack = markerInv.getItem(i);
+            if (stack.isEmpty()) {
+                continue;
+            }
+            // 右键标记的 WrappedGenericStack（流体/气体等任意 key）→ 直接取 key
+            if (stack.getItem() instanceof appeng.items.misc.WrappedGenericStack wgs) {
+                AEKey wrapped = wgs.unwrapWhat(stack);
+                if (wrapped != null) {
+                    keys.add(wrapped);
+                    continue;
+                }
+            }
+            // 旧方式兜底：流体容器（桶/罐/蓄液罐）→ 标记内部流体；否则标记物品
+            var contained = FluidUtil.getFluidContained(stack);
+            if (contained.isPresent() && !contained.get().isEmpty()) {
+                keys.add(AEFluidKey.of(contained.get()));
+                continue;
+            }
+            // 气体容器（气罐/气桶）→ 标记内部气体
+            AEKey gasKey = com.ae2addon.compat.MekanismGasCompat.chemicalInContainer(stack);
+            if (gasKey != null) {
+                keys.add(gasKey);
+                continue;
+            }
+            AEItemKey key = AEItemKey.of(stack);
+            if (key != null) {
+                keys.add(key);
+            }
+        }
+        return keys;
+    }
+
+    /** 查找机器的流体 handler：指定面优先，找不到遍历其余面。 */
+    private static IFluidHandler findFluidHandler(BlockEntity target, Direction primary) {
+        if (target == null) {
+            return null;
+        }
+        Level targetLevel = target.getLevel();
+        if (targetLevel == null) {
+            return null;
+        }
+        IFluidHandler handler = targetLevel.getCapability(
+                Capabilities.FluidHandler.BLOCK, target.getBlockPos(), target.getBlockState(), target, primary);
+        if (handler != null) {
+            return handler;
+        }
+        for (Direction side : Direction.values()) {
+            if (side == primary) {
+                continue;
+            }
+            handler = targetLevel.getCapability(
+                    Capabilities.FluidHandler.BLOCK, target.getBlockPos(), target.getBlockState(), target, side);
+            if (handler != null) {
+                return handler;
+            }
+        }
+        return null;
+    }
+
+    /** ③ 按机器容量分批喂出：insertItem 拒收的余量留在蓄水池。 */
+    private void feedMachine() {
+        if (!activeFeed) {
+            return; // GUI 开关：主动喂出关闭
+        }
+        if (!redstoneAllowsFeed()) {
+            return; // 感应卡：红石信号不允许时暂停喂出
+        }
+        Direction front = getFront();
+        if (front == null) {
+            return;
+        }
+        BlockEntity target = level.getBlockEntity(worldPosition.relative(front));
+        if (target == null) {
+            return;
+        }
+        IItemHandler handler = null;
+        Level tLevel = target.getLevel();
+        if (tLevel != null) {
+            handler = tLevel.getCapability(
+                    Capabilities.ItemHandler.BLOCK, target.getBlockPos(), target.getBlockState(), target, front.getOpposite());
+        }
+        // 流体 handler：前脸优先，找不到遍历机器所有面（部分机器输入面配置不同）
+        IFluidHandler fluidHandler = findFluidHandler(target, front.getOpposite());
+        int slots = handler == null ? 0 : handler.getSlots();
+        if (slots <= 0 && fluidHandler == null) {
+            if (!feederDiagLogged) {
+                feederDiagLogged = true;
+                logFeederStatus("启动(无IItemHandler/无IFluidHandler)");
+            }
+            return;
+        }
+        // 可喂种类数（物品+流体，并行轮转基数）：预算均分，所有种类同时推进
+        int feedable = 0;
+        for (var entry : reservoir.entrySet()) {
+            if ((entry.getKey() instanceof AEItemKey || entry.getKey() instanceof AEFluidKey
+                    || com.ae2addon.compat.MekanismGasCompat.isFeedable(entry.getKey()))
+                    && entry.getValue().signum() > 0) {
+                if (!activeMarkerFeed && !patternKeys.contains(entry.getKey())) {
+                    continue; // 标记喂出关闭：标记缓存不计入可喂（只喂样板）
+                }
+                feedable++;
+            }
+        }
+        if (feedable <= 0) {
+            return;
+        }
+        // 速度卡：每张喂出预算 ×2（最高 ×4）
+        int budget = Math.min(feedBudgetValue(), 1_000_000);
+        int perItemBudget = Math.max(1, budget / feedable);
+        int totalBudget = budget;
+        long fedAll = 0;
+        for (var it = reservoir.entrySet().iterator(); it.hasNext() && totalBudget > 0; ) {
+            var entry = it.next();
+            AEKey key = entry.getKey();
+            BigInteger remain = entry.getValue();
+            if (remain.signum() <= 0) {
+                it.remove();
+                continue;
+            }
+            if (!activeMarkerFeed && !patternKeys.contains(key)) {
+                continue; // 标记喂出关闭：标记补货缓存留蓄水池，不占机器格子
+            }
+            long amount = remain.min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+            long fed = 0;
+            int itemBudget = perItemBudget;
+            if (key instanceof AEItemKey itemKey && handler != null) {
+                while (amount > 0 && itemBudget > 0 && totalBudget > 0) {
+                    int chunk = (int) Math.min(FEED_STACK, amount);
+                    ItemStack stack = itemKey.toStack(chunk);
+                    ItemStack leftover = stack;
+                    // 一轮 = 依次尝试所有输入槽（多槽机器并行填满）
+                    for (int slot = 0; slot < slots && !leftover.isEmpty(); slot++) {
+                        leftover = handler.insertItem(slot, leftover, false);
+                    }
+                    int inserted = chunk - leftover.getCount();
+                    if (inserted <= 0) {
+                        break; // 该物品本轮拒收 → 换下一种
+                    }
+                    fed += inserted;
+                    amount -= inserted;
+                    itemBudget--;
+                    totalBudget--;
+                }
+            } else if (key instanceof AEFluidKey fluidKey && fluidHandler != null) {
+                // 流体喂出：fill 到机器液体槽（FluidStack 上限 int）
+                while (amount > 0 && itemBudget > 0 && totalBudget > 0) {
+                    int chunk = (int) Math.min(Integer.MAX_VALUE, amount);
+                    FluidStack fs = fluidKey.toStack(chunk);
+                    int filled = fluidHandler.fill(fs, FluidAction.EXECUTE);
+                    if (filled <= 0) {
+                        break; // 机器液体槽满/不吃该流体
+                    }
+                    fed += filled;
+                    amount -= filled;
+                    itemBudget--;
+                    totalBudget--;
+                }
+            } else if (com.ae2addon.compat.MekanismGasCompat.isFeedable(key)) {
+                // 气体喂出：insertChemical 到机器气体槽（Mekanism 可选集成）
+                while (amount > 0 && itemBudget > 0 && totalBudget > 0) {
+                    long fedOnce = com.ae2addon.compat.MekanismGasCompat.feed(
+                            target, front.getOpposite(), key, amount);
+                    if (fedOnce <= 0) {
+                        break; // 机器气体槽满/不吃该气体
+                    }
+                    fed += fedOnce;
+                    amount -= fedOnce;
+                    itemBudget--;
+                    totalBudget--;
+                }
+            }
+            if (fed > 0) {
+                // ⚠️ 用 entry.setValue/it.remove 而非 computeIfPresent(null)：
+                // 迭代中通过 map 删除会 ConcurrentModificationException（潜在崩溃）
+                BigInteger next = entry.getValue().subtract(BigInteger.valueOf(fed));
+                if (next.signum() > 0) {
+                    entry.setValue(next);
+                } else {
+                    patternKeys.remove(key);
+                    it.remove();
+                }
+                fedAll += fed;
+            }
+        }
+        if (fedAll > 0) {
+            totalFed = totalFed.add(BigInteger.valueOf(fedAll));
+            rateWindowFed += fedAll;
+            setChanged();
+            com.ae2addon.AE2Addon.LOGGER.info(
+                    "[ae2addon][feeder] 喂出 {} 个（{}种并行）→ 蓄水池={}种/合计{}，累计已喂出={}",
+                    fedAll, feedable, reservoirSummary()[0],
+                    fmt(totalAmount()), fmt(totalFed));
+        } else {
+            rejectWindow++; // 有货但整 tick 零喂出 → 机器满/拒收（诊断瓶颈）
+            // 诊断：蓄水池含流体/气体但喂不出（机器无对应槽 or 拒收）
+            if (hasUnfedFluidOrGas() && (level.getGameTime() & 0x7F) == 0) {
+                com.ae2addon.AE2Addon.LOGGER.warn(
+                        "[ae2addon][feeder] 蓄水池含流体/气体但未喂出：物品槽={} 流体槽={} 气体可喂={}，"
+                                + "蓄水池={}种/合计{}",
+                        handler != null, fluidHandler != null,
+                        com.ae2addon.compat.MekanismGasCompat.isLoaded(),
+                        reservoirSummary()[0], fmt(totalAmount()));
+            }
+        }
+    }
+
+    /**
+     * 主动抽取（2026-08-28 sensei）：每 RESTOCK_INTERVAL tick 从正面机器
+     * 抽取物品/流体/气体 → 直接进网络。
+     * 防回流：抽到的若是标记材料（蓄水池/标记列表中存在）则跳过——
+     * 只抽机器里的「产物」，避免喂入材料被抽回的死循环。
+     */
+    private void extractFromMachine() {
+        if (!activeExtract) {
+            return; // GUI 开关：主动抽取关闭
+        }
+        if (level == null || level.isClientSide) {
+            return;
+        }
+        Direction extractDir = getExtractDir();
+        if (extractDir == null) {
+            return;
+        }
+        BlockEntity target = level.getBlockEntity(worldPosition.relative(extractDir));
+        if (target == null) {
+            return;
+        }
+        IGrid grid = getMainNode().getGrid();
+        if (grid == null) {
+            return;
+        }
+        MEStorage storage = grid.getStorageService().getInventory();
+        Direction side = extractDir.getOpposite();
+        try {
+            // 物品：遍历所有槽找产物（标记材料跳过）；全部槽轮流抽
+            // （2026-08-30 sensei：多槽机器只抽 1 槽 → 去掉抽到即停）
+            IItemHandler handler = target.getLevel() == null ? null : target.getLevel().getCapability(
+                    Capabilities.ItemHandler.BLOCK, target.getBlockPos(), target.getBlockState(), target, side);
+            if (handler != null) {
+                if (handler.getSlots() > 0) {
+                    boolean found = false;
+                    for (int slot = 0; slot < handler.getSlots(); slot++) {
+                        var extracted = handler.extractItem(slot, EXTRACT_STACK, true);
+                        if (extracted.isEmpty()) {
+                            continue;
+                        }
+                        var key = appeng.api.stacks.AEItemKey.of(extracted);
+                        if (key == null) {
+                            continue;
+                        }
+                        if (isMarkedMaterial(key)) {
+                            continue; // 材料不抽（防回流）
+                        }
+                        // ⚠️ 部分机器的 IItemHandler 把单次 extractItem 钳制在物品最大堆叠
+                        // （Mekanism 箱子/箱柜 = min(槽内数量, maxStackSize)，原版物品=64），
+                        // 配置的每次抽取量一次拿不完 → 循环试探凑满（2026-08-29 sensei 实测 1024 只出 64）。
+                        // 先模拟收集可抽总量（一次入网），再按网络实际接收量实抽。
+                        int remaining = EXTRACT_STACK;
+                        long available = 0;
+                        int guard = 0;
+                        while (remaining > 0 && guard++ < 65536) {
+                            var part = handler.extractItem(slot, remaining, true);
+                            if (part.isEmpty()) {
+                                break;
+                            }
+                            var partKey = appeng.api.stacks.AEItemKey.of(part);
+                            if (partKey == null || !partKey.equals(key)) {
+                                break; // 槽内容变化（防御）
+                            }
+                            int n = Math.min(part.getCount(), remaining);
+                            if (n <= 0) {
+                                break;
+                            }
+                            available += n;
+                            remaining -= n;
+                        }
+                        if (available <= 0) {
+                            continue;
+                        }
+                        long inserted = storage.insert(
+                                key, available, Actionable.MODULATE, actionSource);
+                        if (inserted > 0) {
+                            // 按网络实收量从机器取出（单次仍可能被钳制，循环取）
+                            int toExtract = (int) Math.min(inserted, Integer.MAX_VALUE);
+                            while (toExtract > 0) {
+                                var got = handler.extractItem(slot, toExtract, false);
+                                if (got.isEmpty()) {
+                                    break;
+                                }
+                                toExtract -= Math.min(got.getCount(), toExtract);
+                            }
+                            found = true;
+                            com.ae2addon.AE2Addon.LOGGER.info(
+                                    "[ae2addon][feeder] 主动抽取: {} x{} → 网络（槽{}）",
+                                    key, inserted, slot);
+                        }
+                    }
+                    if (!found && (level.getGameTime() & 0xFF) == 0) {
+                        // 节流诊断：为什么抽不到
+                        StringBuilder info = new StringBuilder();
+                        for (int slot = 0; slot < Math.min(handler.getSlots(), 6); slot++) {
+                            var st = handler.getStackInSlot(slot);
+                            info.append(st.isEmpty() ? "[空]" : st.getHoverName().getString() + "x" + st.getCount());
+                            info.append(' ');
+                        }
+                        com.ae2addon.AE2Addon.LOGGER.info(
+                                "[ae2addon][feeder] 抽取诊断: 机器{} 槽{} 内容: {} (方向{} side={})",
+                                target.getBlockState().getBlock().getDescriptionId(),
+                                handler.getSlots(), info, extractDir, side);
+                    }
+                }
+            }
+            // 流体：逐罐 drain（产物跳过标记材料；2026-08-30 多罐机器全罐抽）
+            IFluidHandler fluidHandler = target.getLevel() == null ? null : target.getLevel().getCapability(
+                    Capabilities.FluidHandler.BLOCK, target.getBlockPos(), target.getBlockState(), target, side);
+            if (fluidHandler != null) {
+                if (fluidHandler.getTanks() > 0) {
+                    for (int tank = 0; tank < fluidHandler.getTanks(); tank++) {
+                        var inTank = fluidHandler.getFluidInTank(tank);
+                        if (inTank.isEmpty()) {
+                            continue;
+                        }
+                        var key = appeng.api.stacks.AEFluidKey.of(inTank.getFluid());
+                        if (key == null || isMarkedMaterial(key)) {
+                            continue;
+                        }
+                        long amount = Math.min(inTank.getAmount(), EXTRACT_FLUID);
+                        if (amount <= 0) {
+                            continue;
+                        }
+                        var drained = fluidHandler.drain(new net.neoforged.neoforge.fluids.FluidStack(
+                                inTank.getFluid(), (int) amount),
+                                net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction.SIMULATE);
+                        if (drained.isEmpty()) {
+                            continue;
+                        }
+                        long inserted = storage.insert(
+                                key, drained.getAmount(), Actionable.MODULATE, actionSource);
+                        if (inserted > 0) {
+                            fluidHandler.drain(new net.neoforged.neoforge.fluids.FluidStack(
+                                    inTank.getFluid(), (int) inserted),
+                                    net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction.EXECUTE);
+                            com.ae2addon.AE2Addon.LOGGER.info(
+                                    "[ae2addon][feeder] 主动抽取: {} {}mB → 网络（罐{}）", key, inserted, tank);
+                        }
+                    }
+                }
+            }
+            // 化学物（气体/灌注/颜料/浆液）：遍历各类型 handler 所有罐
+            // （2026-08-30 sensei：原来只抽气体，浆液/颜料抽不出来）
+            if (com.ae2addon.compat.MekanismGasCompat.isLoaded()) {
+                // Mekanism 10.7：气体/灌注/颜料/浆液已统一为一个 CHEMICAL 能力，只抽一次
+                extractChemicalsFrom(target, side, storage);
+            }
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    /** 化学物抽取（Mekanism 10.7 统一 CHEMICAL 能力）：遍历机器所有化学槽（2026-08-30 sensei）。 */
+    private void extractChemicalsFrom(BlockEntity target, Direction side, MEStorage storage) {
+        Level tl = target.getLevel();
+        mekanism.api.chemical.IChemicalHandler ch = tl == null ? null
+                : mekanism.common.capabilities.Capabilities.CHEMICAL.getCapabilityIfLoaded(
+                        tl, target.getBlockPos(), side);
+        if (ch == null || ch.getChemicalTanks() <= 0) {
+            return;
+        }
+        for (int tank = 0; tank < ch.getChemicalTanks(); tank++) {
+            var inTank = ch.getChemicalInTank(tank);
+            if (inTank == null || inTank.isEmpty()) {
+                continue;
+            }
+            AEKey key = com.ae2addon.compat.MekanismGasCompat.keyOfChemical(inTank);
+            if (key == null || isMarkedMaterial(key)) {
+                continue;
+            }
+            long amount = Math.min(inTank.getAmount(), EXTRACT_GAS);
+            if (amount <= 0) {
+                continue;
+            }
+            var sim = ch.extractChemical(tank, amount, mekanism.api.Action.SIMULATE);
+            if (sim == null || sim.isEmpty()) {
+                continue;
+            }
+            long got = Math.min(sim.getAmount(), amount);
+            if (got <= 0) {
+                continue;
+            }
+            long inserted = storage.insert(key, got, Actionable.MODULATE, actionSource);
+            if (inserted > 0) {
+                ch.extractChemical(tank, inserted, mekanism.api.Action.EXECUTE);
+                com.ae2addon.AE2Addon.LOGGER.info(
+                        "[ae2addon][feeder] 主动抽取: {} {}单位 → 网络（罐{}）", key, inserted, tank);
+            }
+        }
+    }
+
+    /** 是否为标记材料（标记列表或蓄水池缓存中）——是则跳过抽取（防回流）。 */
+    private boolean isMarkedMaterial(AEKey key) {
+        if (wantedKeys().contains(key)) {
+            return true;
+        }
+        var have = reservoir.get(key);
+        return have != null && have.signum() > 0;
+    }
+
+    /** 蓄水池中数量最多的物品（正面/侧面抽取预览共用）。 */
+    private Map.Entry<AEKey, BigInteger> largestItem() {
+        Map.Entry<AEKey, BigInteger> best = null;
+        for (var entry : reservoir.entrySet()) {
+            if (!(entry.getKey() instanceof AEItemKey) || entry.getValue().signum() <= 0) {
+                continue;
+            }
+            if (best == null
+                    || entry.getValue().compareTo(best.getValue()) > 0) {
+                best = entry;
+            }
+        }
+        return best;
+    }
+
+    /** 感应卡供电：网络 FE → 正面机器能量槽（独立于喂出；蓄水池空也供电）。 */
+    private void feedMachinePower() {
+        if (!hasInductionCard()) {
+            return;
+        }
+        if (level == null || level.isClientSide) {
+            return;
+        }
+        try {
+            Direction front = getFront();
+            if (front == null) {
+                return;
+            }
+            BlockEntity target = level.getBlockEntity(worldPosition.relative(front));
+            if (target == null) {
+                return;
+            }
+            long fe = com.ae2addon.compat.AppFluxPowerCompat.feedEnergy(
+                    target, front.getOpposite(), getMainNode().getGrid(), actionSource);
+            if (fe > 0 && (level.getGameTime() & 0x3F) == 0) {
+                com.ae2addon.AE2Addon.LOGGER.info(
+                        "[ae2addon][feeder] 供电 {} FE/tick（感应卡）", fe);
+            }
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    /** 蓄水池是否含流体/气体 key（诊断用）。 */
+    private boolean hasUnfedFluidOrGas() {
+        for (var entry : reservoir.entrySet()) {
+            AEKey key = entry.getKey();
+            if ((key instanceof AEFluidKey
+                    || com.ae2addon.compat.MekanismGasCompat.isFeedable(key))
+                    && entry.getValue().signum() > 0) {
+                if (!activeMarkerFeed && !patternKeys.contains(key)) {
+                    continue; // 标记喂出关闭：标记缓存不喂出属正常，不告警
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ── 蓄水池操作 ──
+
+    private void addReservoir(AEKey key, BigInteger amount) {
+        if (amount.signum() <= 0) {
+            return;
+        }
+        reservoir.merge(key, amount, BigInteger::add);
+    }
+
+    private void subtractReservoir(AEKey key, long amount) {
+        if (amount <= 0) {
+            return;
+        }
+        reservoir.computeIfPresent(key, (k, v) -> {
+            BigInteger next = v.subtract(BigInteger.valueOf(amount));
+            if (next.signum() <= 0) {
+                patternKeys.remove(key);
+                return null;
+            }
+            return next;
+        });
+    }
+
+    private long reservoirAmount(AEKey key) {
+        BigInteger amount = reservoir.get(key);
+        if (amount == null) {
+            return 0;
+        }
+        return amount.min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+    }
+
+    // ── 样板管理 ──
+
+    public SimpleContainer getPatternInventory() {
+        return patternInv;
+    }
+
+    public SimpleContainer getMarkerInventory() {
+        return markerInv;
+    }
+
+    /** 标记槽中已放置的物品种数（GUI 状态用）。 */
+    public int markerCount() {
+        int count = 0;
+        for (int i = 0; i < markerInv.getContainerSize(); i++) {
+            if (!markerInv.getItem(i).isEmpty()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** 上次标记的 key 集合（变化检测：消失的标记 → 退回蓄水池缓存）。 */
+    private java.util.Set<AEKey> lastMarkedKeys = java.util.Collections.emptySet();
+
+    private void onMarkersChanged() {
+        setChanged();
+        // 标记区不占真实存储：标记取消 → 对应蓄水池缓存退回网络（2026-08-28 sensei）
+        java.util.Set<AEKey> now = wantedKeys();
+        if (level == null || level.isClientSide || now.equals(lastMarkedKeys)) {
+            lastMarkedKeys = now;
+            return;
+        }
+        IGrid grid = getMainNode().getGrid();
+        if (grid != null) {
+            MEStorage storage = grid.getStorageService().getInventory();
+            for (AEKey gone : lastMarkedKeys) {
+                if (now.contains(gone)) {
+                    continue;
+                }
+                java.math.BigInteger amount = reservoir.remove(gone);
+                if (amount != null && amount.signum() > 0 && storage != null) {
+                    try {
+                        long back = amount.min(java.math.BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+                        long inserted = storage.insert(gone, back, Actionable.MODULATE, actionSource);
+                        com.ae2addon.AE2Addon.LOGGER.info(
+                                "[ae2addon][feeder] 标记取消，退回缓存 {} x{}（蓄水池余 {}）",
+                                gone, inserted, reservoirAmount(gone));
+                    } catch (RuntimeException e) {
+                        com.ae2addon.AE2Addon.LOGGER.warn(
+                                "[ae2addon][feeder] 退回缓存失败 {} {}", gone, e);
+                    }
+                }
+            }
+        }
+        lastMarkedKeys = now;
+    }
+
+    /**
+     * 右键标记槽：用手中物品直接标记流体/气体/物品（2026-08-28 sensei 要求，
+     * 不放入槽、不消耗容器）。流体/气体包成 WrappedGenericStack 显示，
+     * 普通物品放 1 个作视觉；空手右键 = 清空标记。
+     */
+    public boolean handleMarkerRightClick(int markerIndex, ItemStack carried) {
+        if (markerIndex < 0 || markerIndex >= markerInv.getContainerSize()) {
+            return false;
+        }
+        if (carried.isEmpty()) {
+            markerInv.setItem(markerIndex, ItemStack.EMPTY);
+            return true;
+        }
+        // 流体容器 → 标记流体
+        var contained = FluidUtil.getFluidContained(carried);
+        if (contained.isPresent() && !contained.get().isEmpty()) {
+            markByKey(markerIndex, AEFluidKey.of(contained.get()));
+            return true;
+        }
+        // 气体容器（气罐/气桶）→ 标记气体
+        AEKey gasKey = com.ae2addon.compat.MekanismGasCompat.chemicalInContainer(carried);
+        if (gasKey != null) {
+            markByKey(markerIndex, gasKey);
+            return true;
+        }
+        // 普通物品 → 虚拟标记（WrappedGenericStack，不占用真实物品）
+        var itemKey = appeng.api.stacks.AEItemKey.of(carried);
+        if (itemKey != null) {
+            markByKey(markerIndex, itemKey);
+            return true;
+        }
+        return false;
+    }
+
+    /** 按 AEKey 直接标记（JEI 拖取/右键共用）；null key = 清空。 */
+    public void markByKey(int markerIndex, AEKey key) {
+        if (markerIndex < 0 || markerIndex >= markerInv.getContainerSize()) {
+            return;
+        }
+        if (key == null) {
+            markerInv.setItem(markerIndex, ItemStack.EMPTY);
+            return;
+        }
+        markerInv.setItem(markerIndex,
+                appeng.items.misc.WrappedGenericStack.wrap(key, 1));
+    }
+
+    /** 清空标记（JEI/网络包用）。 */
+    public void clearMarker(int markerIndex) {
+        markByKey(markerIndex, null);
+    }
+
+    /** 方块拆除时掉落样板槽物品 + 升级卡（玩家资源；蓄水池物品属于网络/CPU，不返还防刷）。 */
+    @Override
+    public void addAdditionalDrops(Level level, BlockPos pos, List<ItemStack> drops) {
+        for (int i = 0; i < patternInv.getContainerSize(); i++) {
+            ItemStack stack = patternInv.getItem(i);
+            if (!stack.isEmpty()) {
+                drops.add(stack);
+            }
+        }
+        for (int i = 0; i < upgrades.size(); i++) {
+            ItemStack stack = upgrades.getStackInSlot(i);
+            if (!stack.isEmpty()) {
+                drops.add(stack);
+            }
+        }
+        // 配置（标记/目标/开关/方向）写入掉落的方块本体，重放自动恢复
+        for (ItemStack drop : drops) {
+            if (drop.getItem() == com.ae2addon.init.ModItems.INFINITE_INTERFACE_ITEM.get()) {
+                writeConfigToStack(drop, level.registryAccess());
+                break;
+            }
+        }
+    }
+
+    /**
+     * 配置写入掉落方块 NBT（2026-08-28 sensei）：标记槽/缓存目标/开关/抽取方向
+     * 随方块掉落，重新放置自动恢复（loadAdditional 同键读取）。
+     * 蓄水池缓存不进 NBT（属于网络/CPU，防刷）。
+     */
+    private void writeConfigToStack(ItemStack stack, net.minecraft.core.HolderLookup.Provider registries) {
+        // 1.21：getOrCreateTag 已移除，自定义 NBT 走 DataComponents.CUSTOM_DATA（读写后写回）
+        CompoundTag tag = stack.getOrDefault(DataComponents.CUSTOM_DATA, CustomData.EMPTY).copyTag();
+        ListTag markerList = new ListTag();
+        for (int i = 0; i < markerInv.getContainerSize(); i++) {
+            ItemStack st = markerInv.getItem(i);
+            if (!st.isEmpty()) {
+                CompoundTag ent = new CompoundTag();
+                ent.putInt("Slot", i);
+                st.save(registries, ent);
+                markerList.add(ent);
+            }
+        }
+        tag.put("markers", markerList);
+        ListTag targetList = new ListTag();
+        for (var e : markerTargets.entrySet()) {
+            CompoundTag ent = new CompoundTag();
+            ent.put("Key", appeng.items.misc.WrappedGenericStack.wrap(e.getKey(), 1).save(registries, new CompoundTag()));
+            ent.putLong("Target", e.getValue());
+            targetList.add(ent);
+        }
+        tag.put("markerTargets", targetList);
+        tag.putBoolean("activeExtract", activeExtract);
+        tag.putBoolean("activeFeed", activeFeed);
+        tag.putBoolean("activeMarkerFeed", activeMarkerFeed);
+        tag.putString("extractSide", extractSide.name());
+        tag.putLong("pStockTarget", pStockTarget);
+        tag.putInt("pRestockInterval", pRestockInterval);
+        tag.putInt("pFeedBudget", pFeedBudget);
+        tag.putLong("pStockTarget", pStockTarget);
+        tag.putInt("pRestockInterval", pRestockInterval);
+        tag.putInt("pFeedBudget", pFeedBudget);
+        stack.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
+    }
+
+    private void onPatternsChanged() {
+        patternDirty = true;
+        patterns = List.of();
+        if (level != null && level.isClientSide) {
+            return;
+        }
+        if (getMainNode().isReady()) {
+            ICraftingProvider.requestUpdate(getMainNode());
+        }
+        setChanged();
+    }
+
+    private void rebuildPatterns() {
+        patternDirty = false;
+        Level lvl = level;
+        List<IPatternDetails> list = new ArrayList<>();
+        if (lvl != null) {
+            int limit = Math.min(patternInv.getContainerSize(), activePatternSlots());
+            for (int i = 0; i < limit; i++) {
+                ItemStack stack = patternInv.getItem(i);
+                if (stack.isEmpty()) {
+                    continue;
+                }
+                IPatternDetails details = PatternDetailsHelper.decodePattern(stack, lvl);
+                // 2026-08-28 兼容：接口不接合成样板（AECraftingPattern）——合成需分子
+                // 装配室/样板供应器执行，接口只能喂处理机器；接了会导致 CPU 把合成任务
+                // 推给接口而机器无法执行（sensei 提醒）
+                if (details != null && !details.getClass().getName().endsWith("AECraftingPattern")) {
+                    list.add(details);
+                }
+            }
+        }
+        patterns = List.copyOf(list);
+        if (getMainNode().isReady()) {
+            ICraftingProvider.requestUpdate(getMainNode());
+        }
+    }
+
+    // ── 方向 ──
+
+    /** 正面 = 方块 FACING 朝向（机器所在侧）。 */
+    @Nullable
+    public Direction getFront() {
+        BlockState state = getBlockState();
+        if (state == null) {
+            return null;
+        }
+        BlockOrientation orientation = BlockOrientation.get(state);
+        return orientation.getSide(RelativeSide.FRONT);
+    }
+
+    // ── 化学物侧面抽取（Mekanism 10.7 统一 IChemicalHandler；气体/灌注/颜料/浆液
+    //    已不再分形态，单一 CHEMICAL 能力；drain 从蓄水池扣化学物） ──
+
+    private final mekanism.api.chemical.IChemicalHandler networkChemicalHandler =
+            new mekanism.api.chemical.IChemicalHandler() {
+                @Override
+                public int getChemicalTanks() {
+                    return 1;
+                }
+
+                @Override
+                public mekanism.api.chemical.ChemicalStack getChemicalInTank(int tank) {
+                    if (tank != 0) {
+                        return mekanism.api.chemical.ChemicalStack.EMPTY;
+                    }
+                    // 蓄水池中数量最多的化学物预览（Jade/管道能看到真实化学物与数量）
+                    var best = largestChemical();
+                    if (best == null) {
+                        return mekanism.api.chemical.ChemicalStack.EMPTY;
+                    }
+                    var mk = com.ae2addon.compat.MekanismGasCompat.mekKeyOf(best.getKey());
+                    if (mk == null) {
+                        return mekanism.api.chemical.ChemicalStack.EMPTY;
+                    }
+                    long amt = best.getValue().min(BigInteger.valueOf(Integer.MAX_VALUE)).longValue();
+                    return mk.getStack().copyWithAmount(Math.max(1, amt));
+                }
+
+                @Override
+                public void setChemicalInTank(int tank, mekanism.api.chemical.ChemicalStack stack) {
+                    // 只读（蓄水池视图），忽略写入
+                }
+
+                @Override
+                public long getChemicalTankCapacity(int tank) {
+                    return Integer.MAX_VALUE;
+                }
+
+                @Override
+                public boolean isValid(int tank, mekanism.api.chemical.ChemicalStack stack) {
+                    return !stack.isEmpty();
+                }
+
+                @Override
+                public mekanism.api.chemical.ChemicalStack insertChemical(int tank,
+                        mekanism.api.chemical.ChemicalStack resource, mekanism.api.Action action) {
+                    return insertChemical(resource, action);
+                }
+
+                @Override
+                public mekanism.api.chemical.ChemicalStack extractChemical(int tank, long amount,
+                        mekanism.api.Action action) {
+                    return extractChemical(amount, action);
+                }
+
+                @Override
+                public mekanism.api.chemical.ChemicalStack insertChemical(
+                        mekanism.api.chemical.ChemicalStack resource, mekanism.api.Action action) {
+                    return insertChemToNetwork(resource, action);
+                }
+
+                @Override
+                public mekanism.api.chemical.ChemicalStack extractChemical(long amount,
+                        mekanism.api.Action action) {
+                    if (amount <= 0) {
+                        return mekanism.api.chemical.ChemicalStack.EMPTY;
+                    }
+                    // 蓄水池中数量最多的化学物（管道无指定时的通用抽取）
+                    var best = largestChemical();
+                    if (best == null) {
+                        return mekanism.api.chemical.ChemicalStack.EMPTY;
+                    }
+                    var mk = com.ae2addon.compat.MekanismGasCompat.mekKeyOf(best.getKey());
+                    if (mk == null) {
+                        return mekanism.api.chemical.ChemicalStack.EMPTY;
+                    }
+                    long take = best.getValue().min(BigInteger.valueOf(amount))
+                            .min(BigInteger.valueOf(Integer.MAX_VALUE)).longValue();
+                    if (take <= 0) {
+                        return mekanism.api.chemical.ChemicalStack.EMPTY;
+                    }
+                    if (!action.simulate()) {
+                        subtractReservoir(best.getKey(), take);
+                        setChanged();
+                    }
+                    return mk.getStack().copyWithAmount(take);
+                }
+
+                @Override
+                public mekanism.api.chemical.ChemicalStack extractChemical(
+                        mekanism.api.chemical.ChemicalStack stack, mekanism.api.Action action) {
+                    return extractChemFromReservoir(stack, action);
+                }
+            };
+
+    /** 化学物塞入网络入口 → 直接进网络（返回剩余；Mekanism 10.7 统一化学物）。 */
+    private mekanism.api.chemical.ChemicalStack insertChemToNetwork(
+            mekanism.api.chemical.ChemicalStack resource, mekanism.api.Action action) {
+        if (resource.isEmpty()) {
+            return resource;
+        }
+        IGrid grid = getMainNode().getGrid();
+        if (grid == null) {
+            return resource;
+        }
+        try {
+            AEKey key = com.ae2addon.compat.MekanismGasCompat.keyOfChemical(resource);
+            if (key == null) {
+                return resource;
+            }
+            long inserted = grid.getStorageService().getInventory().insert(
+                    key, resource.getAmount(),
+                    action.simulate() ? Actionable.SIMULATE : Actionable.MODULATE,
+                    actionSource);
+            if (inserted <= 0) {
+                return resource;
+            }
+            if (inserted >= resource.getAmount()) {
+                return mekanism.api.chemical.ChemicalStack.EMPTY;
+            }
+            return resource.copyWithAmount(resource.getAmount() - inserted);
+        } catch (RuntimeException e) {
+            return resource;
+        }
+    }
+
+    /** 按指定化学物从蓄水池抽取（返回抽出的 stack；Mekanism 10.7 统一化学物）。 */
+    private mekanism.api.chemical.ChemicalStack extractChemFromReservoir(
+            mekanism.api.chemical.ChemicalStack stack, mekanism.api.Action action) {
+        if (stack.isEmpty()) {
+            return stack;
+        }
+        AEKey key = com.ae2addon.compat.MekanismGasCompat.keyOfChemical(stack);
+        if (key == null) {
+            return stack;
+        }
+        long have = reservoirAmount(key);
+        long take = Math.min(have, stack.getAmount());
+        if (take <= 0) {
+            return mekanism.api.chemical.ChemicalStack.EMPTY;
+        }
+        if (!action.simulate()) {
+            subtractReservoir(key, take);
+            setChanged();
+        }
+        return stack.copyWithAmount(take);
+    }
+
+    // （Mekanism 10.7 统一后不再分 INFUSION/PIGMENT/SLURRY handler；
+    //  三个旧形态入口已合并进上方 networkChemicalHandler）
+    /** 蓄水池中数量最多的化学物（Mekanism 10.7 统一化学物；侧面抽取预览/通用抽取用）。 */
+    private Map.Entry<AEKey, BigInteger> largestChemical() {
+        Map.Entry<AEKey, BigInteger> best = null;
+        for (var entry : reservoir.entrySet()) {
+            if (com.ae2addon.compat.MekanismGasCompat.mekKeyOf(entry.getKey()) == null
+                    || entry.getValue().signum() <= 0) {
+                continue;
+            }
+            if (best == null || entry.getValue().compareTo(best.getValue()) > 0) {
+                best = entry;
+            }
+        }
+        return best;
+    }
+
+    // ── 正面/网络能力暴露（NeoForge 1.21.1）──
+    //
+    // ⚠️【改动说明：能力暴露改为 getter】NeoForge 1.21.1 的 BlockEntity 已不再提供
+    // getCapability(Capability<T>, Direction)/invalidateCaps() 覆写点，方块能力改由
+    // RegisterCapabilitiesEvent（event.registerBlockEntity(...)）注册。
+    // 本类在此仅暴露各 handler 的 getter（即注册时的 (be, side) -> handler 工厂），
+    // 实际注册需在 mod 注册代码（如 AE2Addon.java）中完成，例如：
+    //   event.registerBlockEntity(Capabilities.ItemHandler.BLOCK, ModBlockEntities.INFINITE_INTERFACE.get(),
+    //       (be, side) -> ((InfiniteInterfaceBE) be).getItemHandler(side));
+    //   event.registerBlockEntity(Capabilities.FluidHandler.BLOCK, ModBlockEntities.INFINITE_INTERFACE.get(),
+    //       (be, side) -> ((InfiniteInterfaceBE) be).getNetworkFluidHandler());
+    // ★ Mekanism 10.7 化学能力（统一 CHEMICAL）的注册需用
+    //   Capabilities.CHEMICAL.block()（BlockCapability<IChemicalHandler, Direction>）。
+
+    /** 正面/网络物品 handler：正面返回 FrontItemHandler（机器抽取），其余返回网络入口。 */
+    public IItemHandler getItemHandler(@Nullable Direction side) {
+        if (side == getFront()) {
+            return frontHandler;
+        }
+        return networkItemHandler;
+    }
+
+    /** 网络流体入口（所有面）。 */
+    public IFluidHandler getNetworkFluidHandler() {
+        return networkFluidHandler;
+    }
+
+    /**
+     * 化学能力入口（Mekanism 10.7 统一 CHEMICAL），仅供 registerBlockEntity 的
+     * 工厂 lambda 调用。cap 为 Capabilities.CHEMICAL.block()。
+     */
+    public Object getChemHandler(@Nullable Direction side, BlockCapability<?, Direction> cap) {
+        if (cap == mekanism.common.capabilities.Capabilities.CHEMICAL.block()) {
+            return networkChemicalHandler;
+        }
+        return null;
+    }
+
+    /**
+     * 正面虚拟单槽：slot 0 = 蓄水池中数量最多的物品。
+     * extractItem 从蓄水池扣；insertItem 被动收下 → 直接进网络
+     * （2026-08-30 sensei：机器 IO 槽位难懂时留后路，机器/管道从正面塞的产物能接住）。
+     */
+    private final class FrontItemHandler implements IItemHandler {
+
+        @Override
+        public int getSlots() {
+            return 1;
+        }
+
+        @Override
+        public ItemStack getStackInSlot(int slot) {
+            if (slot != 0) {
+                return ItemStack.EMPTY;
+            }
+            var best = largestItem();
+            if (best == null) {
+                return ItemStack.EMPTY;
+            }
+            long amount = best.getValue()
+                    .min(BigInteger.valueOf(Integer.MAX_VALUE)).longValue();
+            return ((AEItemKey) best.getKey()).toStack((int) Math.max(1, amount));
+        }
+
+        @Override
+        public ItemStack insertItem(int slot, ItemStack stack, boolean simulate) {
+            // 正面被动输入：机器/管道从正面塞入 → 直接进网络（与侧面入口一致）
+            if (stack.isEmpty()) {
+                return ItemStack.EMPTY;
+            }
+            IGrid grid = getMainNode().getGrid();
+            if (grid == null) {
+                return stack;
+            }
+            try {
+                var key = appeng.api.stacks.AEItemKey.of(stack);
+                if (key == null) {
+                    return stack;
+                }
+                long inserted = grid.getStorageService().getInventory().insert(
+                        key, stack.getCount(),
+                        simulate ? Actionable.SIMULATE : Actionable.MODULATE,
+                        actionSource);
+                if (inserted <= 0) {
+                    return stack;
+                }
+                if (inserted >= stack.getCount()) {
+                    return ItemStack.EMPTY;
+                }
+                ItemStack rest = stack.copy();
+                rest.setCount(stack.getCount() - (int) inserted);
+                return rest;
+            } catch (RuntimeException e) {
+                return stack;
+            }
+        }
+
+        @Override
+        public ItemStack extractItem(int slot, int amount, boolean simulate) {
+            if (slot != 0 || amount <= 0) {
+                return ItemStack.EMPTY;
+            }
+            var best = largestItem();
+            if (best == null) {
+                return ItemStack.EMPTY;
+            }
+            AEItemKey itemKey = (AEItemKey) best.getKey();
+            long take = best.getValue()
+                    .min(BigInteger.valueOf(amount)).min(BigInteger.valueOf(FEED_STACK))
+                    .longValue();
+            if (take <= 0) {
+                return ItemStack.EMPTY;
+            }
+            if (!simulate) {
+                subtractReservoir(itemKey, take);
+                totalFed = totalFed.add(BigInteger.valueOf(take));
+                setChanged();
+            }
+            return itemKey.toStack((int) take);
+        }
+
+        @Override
+        public int getSlotLimit(int slot) {
+            // 反映真实缓存上限（补货目标），Jade/管道显示不误导
+            return (int) Math.min(Math.max(STOCK_TARGET, 1), Integer.MAX_VALUE);
+        }
+
+        @Override
+        public boolean isItemValid(int slot, ItemStack stack) {
+            return !stack.isEmpty(); // 被动输入：收机器/管道塞入
+        }
+
+    }
+
+    // ── NBT ──
+
+    @Override
+    public void saveAdditional(CompoundTag tag, net.minecraft.core.HolderLookup.Provider registries) {
+        super.saveAdditional(tag, registries);
+
+        ListTag patternList = new ListTag();
+        for (int i = 0; i < patternInv.getContainerSize(); i++) {
+            ItemStack stack = patternInv.getItem(i);
+            if (!stack.isEmpty()) {
+                CompoundTag entry = new CompoundTag();
+                stack.save(registries, entry);
+                entry.putInt("Slot", i);
+                patternList.add(entry);
+            }
+        }
+        tag.put("patterns", patternList);
+
+        ListTag markerList = new ListTag();
+        for (int i = 0; i < markerInv.getContainerSize(); i++) {
+            ItemStack stack = markerInv.getItem(i);
+            if (!stack.isEmpty()) {
+                CompoundTag entry = new CompoundTag();
+                stack.save(registries, entry);
+                entry.putInt("Slot", i);
+                markerList.add(entry);
+            }
+        }
+        tag.put("markers", markerList);
+        // 每标记独立缓存目标
+        ListTag targetList = new ListTag();
+        for (var e : markerTargets.entrySet()) {
+            CompoundTag ent = new CompoundTag();
+            ent.put("Key", appeng.items.misc.WrappedGenericStack.wrap(e.getKey(), 1).save(registries, new CompoundTag()));
+            ent.putLong("Target", e.getValue());
+            targetList.add(ent);
+        }
+        tag.put("markerTargets", targetList);
+        tag.putBoolean("activeExtract", activeExtract);
+        tag.putBoolean("activeFeed", activeFeed);
+        tag.putBoolean("activeMarkerFeed", activeMarkerFeed);
+        tag.putString("extractSide", extractSide.name());
+        // 每接口独立参数（2026-08-28 修复：之前漏存，重进游戏归零）
+        tag.putLong("pStockTarget", pStockTarget);
+        tag.putInt("pRestockInterval", pRestockInterval);
+        tag.putInt("pFeedBudget", pFeedBudget);
+
+        ListTag reservoirList = new ListTag();
+        for (var entry : reservoir.entrySet()) {
+            CompoundTag entryTag = new CompoundTag();
+            entryTag.put("key", entry.getKey().toTagGeneric(registries));
+            entryTag.putString("amount", entry.getValue().toString());
+            reservoirList.add(entryTag);
+        }
+        tag.put("reservoir", reservoirList);
+        tag.putString("totalFed", totalFed.toString());
+        upgrades.writeToNBT(tag, "upgrades", registries);
+    }
+
+    @Override
+    public void loadTag(CompoundTag tag, net.minecraft.core.HolderLookup.Provider registries) {
+        super.loadTag(tag, registries);
+        reservoir.clear();
+
+        ListTag patternList = tag.getList("patterns", Tag.TAG_COMPOUND);
+        patternInv.clearContent();
+        for (int i = 0; i < patternList.size(); i++) {
+            CompoundTag entry = patternList.getCompound(i);
+            ItemStack stack = ItemStack.parseOptional(registries, entry);
+            int slot = entry.getInt("Slot");
+            if (slot >= 0 && slot < patternInv.getContainerSize() && !stack.isEmpty()) {
+                patternInv.setItem(slot, stack);
+            }
+        }
+        patternDirty = true; // level 可能为 null，解码延迟到首个 tick
+
+        ListTag markerList = tag.getList("markers", Tag.TAG_COMPOUND);
+        markerInv.clearContent();
+        for (int i = 0; i < markerList.size(); i++) {
+            CompoundTag entry = markerList.getCompound(i);
+            ItemStack stack = ItemStack.parseOptional(registries, entry);
+            int slot = entry.getInt("Slot");
+            if (slot >= 0 && slot < markerInv.getContainerSize() && !stack.isEmpty()) {
+                markerInv.setItem(slot, stack);
+            }
+        }
+        activeExtract = tag.getBoolean("activeExtract");
+        activeFeed = tag.getBoolean("activeFeed");
+        if (tag.contains("activeMarkerFeed")) {
+            activeMarkerFeed = tag.getBoolean("activeMarkerFeed");
+        }
+        pStockTarget = tag.contains("pStockTarget") ? tag.getLong("pStockTarget") : -1;
+        pRestockInterval = tag.contains("pRestockInterval") ? tag.getInt("pRestockInterval") : -1;
+        pFeedBudget = tag.contains("pFeedBudget") ? tag.getInt("pFeedBudget") : -1;
+        try {
+            extractSide = appeng.api.orientation.RelativeSide.valueOf(
+                    tag.getString("extractSide"));
+        } catch (RuntimeException ignored) {
+            extractSide = appeng.api.orientation.RelativeSide.FRONT;
+        }
+        markerTargets.clear();
+        ListTag targetList = tag.getList("markerTargets", Tag.TAG_COMPOUND);
+        for (int i = 0; i < targetList.size(); i++) {
+            CompoundTag entry = targetList.getCompound(i);
+            try {
+                var stack = net.minecraft.world.item.ItemStack.parseOptional(registries, entry.getCompound("Key"));
+                AEKey wrapped = null;
+                if (stack.getItem() instanceof appeng.items.misc.WrappedGenericStack wgs) {
+                    wrapped = wgs.unwrapWhat(stack);
+                }
+                if (wrapped != null) {
+                    markerTargets.put(wrapped, entry.getLong("Target"));
+                }
+            } catch (RuntimeException ignored) {
+            }
+        }
+
+        ListTag reservoirList = tag.getList("reservoir", Tag.TAG_COMPOUND);
+        for (int i = 0; i < reservoirList.size(); i++) {
+            CompoundTag entry = reservoirList.getCompound(i);
+            try {
+                AEKey key = AEKey.fromTagGeneric(registries, entry.getCompound("key"));
+                BigInteger amount = new BigInteger(entry.getString("amount"));
+                if (key != null && amount.signum() > 0) {
+                    reservoir.put(key, amount);
+                }
+            } catch (RuntimeException ignored) {
+                // 单条损坏不影响整体
+            }
+        }
+        try {
+            totalFed = new BigInteger(tag.getString("totalFed"));
+        } catch (RuntimeException ignored) {
+            totalFed = BigInteger.ZERO;
+        }
+        upgrades.readFromNBT(tag, "upgrades", registries);
+        updateChannelLink();
+    }
+
+    /** 蓄水池概览（GUI 状态用）。返回 [物品种类数, 合计(字符串)]。 */
+    public String[] reservoirSummary() {
+        int types = 0;
+        BigInteger total = BigInteger.ZERO;
+        for (var entry : reservoir.entrySet()) {
+            if (entry.getValue().signum() > 0) {
+                types++;
+                total = total.add(entry.getValue());
+            }
+        }
+        return new String[]{String.valueOf(types), fmt(total)};
+    }
+
+    /** 蓄水池 top N 物品描述（GUI 状态用）。 */
+    public List<String> topItems(int limit) {
+        List<Map.Entry<AEKey, BigInteger>> list = new ArrayList<>();
+        for (var entry : reservoir.entrySet()) {
+            if (entry.getValue().signum() > 0) {
+                list.add(entry);
+            }
+        }
+        list.sort((a, b) -> b.getValue().compareTo(a.getValue()));
+        List<String> out = new ArrayList<>();
+        for (int i = 0; i < Math.min(limit, list.size()); i++) {
+            var entry = list.get(i);
+            String name;
+            try {
+                name = entry.getKey().getDisplayName().getString();
+            } catch (RuntimeException e) {
+                name = entry.getKey().toString();
+            }
+            out.add(name + " × " + fmt(entry.getValue()));
+        }
+        return out;
+    }
+
+    /** 上一秒喂出速率（items/s，GUI 状态用）。 */
+    public long feedRatePerSecond() {
+        return currentFeedRate;
+    }
+
+    /** 上一秒整 tick 零喂出次数（机器满/拒收诊断；0=正常）。 */
+    public long rejectRatePerSecond() {
+        return currentRejectRate;
+    }
+
+    /** 累计已喂出总量（GUI 状态用）。 */
+    public BigInteger totalFed() {
+        return totalFed;
+    }
+
+    /** 蓄水池内物品合计（BigInteger，GUI 显示）。 */
+    public BigInteger totalAmount() {
+        BigInteger total = BigInteger.ZERO;
+        for (BigInteger amount : reservoir.values()) {
+            if (amount.signum() > 0) {
+                total = total.add(amount);
+            }
+        }
+        return total;
+    }
+
+    /** 大数格式化：K/M/G/T/P/E 后缀。 */
+    public static String fmt(BigInteger value) {
+        if (value == null || value.signum() < 0) {
+            return "0";
+        }
+        String[] units = {"", "K", "M", "G", "T", "P", "E"};
+        java.math.BigDecimal d = new java.math.BigDecimal(value);
+        int unit = 0;
+        java.math.BigDecimal thousand = java.math.BigDecimal.valueOf(1000);
+        while (d.compareTo(thousand) >= 0 && unit < units.length - 1) {
+            d = d.divide(thousand);
+            unit++;
+        }
+        if (unit == 0) {
+            return d.toBigInteger().toString();
+        }
+        d = d.setScale(1, java.math.RoundingMode.DOWN);
+        if (d.compareTo(java.math.BigDecimal.valueOf(1000)) >= 0 && unit < units.length - 1) {
+            d = d.divide(thousand).setScale(1, java.math.RoundingMode.DOWN);
+            unit++;
+        }
+        return d.toPlainString() + units[unit];
+    }
+}

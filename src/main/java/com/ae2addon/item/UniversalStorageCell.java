@@ -21,9 +21,10 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Rarity;
 import net.minecraft.world.item.TooltipFlag;
 import net.minecraft.world.level.Level;
-import org.jetbrains.annotations.Nullable;
 
+import java.math.BigInteger;
 import java.util.List;
+import java.util.function.Consumer;
 
 /**
  * 万能无限存储元件
@@ -42,6 +43,75 @@ public class UniversalStorageCell extends Item implements ICellWorkbenchItem {
 
     // ── 右键：模式2→配置界面，其他→模式选择 ──
 
+    /**
+     * Mode 2 配置菜单的 MenuProvider（静态内部类，避免匿名类 $N 加载问题）。
+     * 注意：openScreen 的 buf 写入也必须用静态 Consumer 类（不能 lambda）。
+     */
+    private static class Mode2MenuProvider implements MenuProvider {
+        private final ItemStack stack;
+
+        Mode2MenuProvider(ItemStack stack) {
+            this.stack = stack;
+        }
+
+        @Override
+        public Component getDisplayName() {
+            return Component.translatable("gui.ae2addon.mode2_config");
+        }
+
+        @Override
+        public AbstractContainerMenu createMenu(int id, Inventory inv, Player p) {
+            return new com.ae2addon.gui.Mode2ConfigMenu(id, inv, stack);
+        }
+    }
+
+    /** Mode 1/3 模式选择菜单的 MenuProvider（静态内部类） */
+    private static class ModeSelectMenuProvider implements MenuProvider {
+        private final ItemStack stack;
+
+        ModeSelectMenuProvider(ItemStack stack) {
+            this.stack = stack;
+        }
+
+        @Override
+        public Component getDisplayName() {
+            return Component.translatable("gui.ae2addon.mode_select");
+        }
+
+        @Override
+        public AbstractContainerMenu createMenu(int id, Inventory inv, Player p) {
+            return new ModeSelectMenu(id, inv, stack);
+        }
+    }
+
+    /** openScreen 的 buf 写入器（静态内部类，避免 lambda 合成类问题） */
+    private static class LightStackWriter implements Consumer<net.minecraft.network.RegistryFriendlyByteBuf> {
+        private final ItemStack stack;
+        private final boolean dropModeData; // true=模式1/3（额外移除 a）
+
+        LightStackWriter(ItemStack stack, boolean dropModeData) {
+            this.stack = stack;
+            this.dropModeData = dropModeData;
+        }
+
+        @Override
+        public void accept(net.minecraft.network.RegistryFriendlyByteBuf buf) {
+            // 只传阈值，裁掉 s2/ul/wl 等重 NBT 数据以防止打开菜单时就炸包
+            ItemStack copy = stack.copy();
+            CompoundTag tag = AE2Addon.cellTag(copy);
+            tag.remove("s1");
+            tag.remove("s2");
+            tag.remove("sa");
+            tag.remove("u");
+            tag.remove("w");
+            if (dropModeData) {
+                tag.remove("a");
+            }
+            AE2Addon.setCellTag(copy, tag);
+            ItemStack.OPTIONAL_STREAM_CODEC.encode(buf, copy);
+        }
+    }
+
     @Override
     public InteractionResultHolder<ItemStack> use(Level level, Player player, InteractionHand hand) {
         ItemStack stack = player.getItemInHand(hand);
@@ -53,46 +123,10 @@ public class UniversalStorageCell extends Item implements ICellWorkbenchItem {
 
             if (mode == MODE_CUSTOM) {
                 // NeoForge 1.21：原版 Player.openMenu 直接支持附加数据写入
-                serverPlayer.openMenu(new MenuProvider() {
-                    @Override public Component getDisplayName() {
-                        return Component.translatable("gui.ae2addon.mode2_config");
-                    }
-                    @Override public AbstractContainerMenu createMenu(int id, Inventory inv, Player p) {
-                        return new com.ae2addon.gui.Mode2ConfigMenu(id, inv, stack);
-                    }
-                }, buf -> {
-                    // 只传阈值，裁掉 s2/ul/wl 等重 NBT 数据以防止打开菜单时就炸包
-                    ItemStack copy = stack.copy();
-                    CompoundTag tag = AE2Addon.cellTag(copy);
-                    tag.remove("s1");
-                    tag.remove("s2");
-                    tag.remove("sa");
-                    tag.remove("u");
-                    tag.remove("w");
-                    AE2Addon.setCellTag(copy, tag);
-                    ItemStack.OPTIONAL_STREAM_CODEC.encode(buf, copy);
-                });
+                serverPlayer.openMenu(new Mode2MenuProvider(stack), new LightStackWriter(stack, false));
             } else {
                 // Mode 1 / Mode 3：只传光副本，裁掉存储NBT防炸包
-                serverPlayer.openMenu(new MenuProvider() {
-                    @Override public Component getDisplayName() {
-                        return Component.translatable("gui.ae2addon.mode_select");
-                    }
-                    @Override public AbstractContainerMenu createMenu(int id, Inventory inv, Player p) {
-                        return new ModeSelectMenu(id, inv, stack);
-                    }
-                }, buf -> {
-                    ItemStack copy = stack.copy();
-                    CompoundTag tag = AE2Addon.cellTag(copy);
-                    tag.remove("s1");
-                    tag.remove("s2");
-                    tag.remove("sa");
-                    tag.remove("u");
-                    tag.remove("w");
-                    tag.remove("a");
-                    AE2Addon.setCellTag(copy, tag);
-                    ItemStack.OPTIONAL_STREAM_CODEC.encode(buf, copy);
-                });
+                serverPlayer.openMenu(new ModeSelectMenuProvider(stack), new LightStackWriter(stack, true));
             }
         }
         return InteractionResultHolder.success(stack);
@@ -115,9 +149,9 @@ public class UniversalStorageCell extends Item implements ICellWorkbenchItem {
     @Override
     public Component getName(ItemStack stack) {
         int m = AE2Addon.cellTag(stack).getInt("umode");
-        String[] n = {"", "§a无限制", "§e自定义", "§d全类型"};
+        String[] n = {"", "gui.ae2addon.mode.unlimited", "gui.ae2addon.mode.custom", "gui.ae2addon.mode.all"};
         if (m < 1 || m > 3) m = 1;
-        return Component.literal("§5万能无限 [" + n[m] + "]");
+        return Component.translatable("gui.ae2addon.cell.name", Component.translatable(n[m]));
     }
 
     @Override
@@ -129,39 +163,56 @@ public class UniversalStorageCell extends Item implements ICellWorkbenchItem {
 
         String[][] info = {
                 {},
-                {"§a无限制存储", "§7无限容量·全AE类型·正常存取"},
-                {"§e自定义无限", "§7白名单无限 + 通用阈值"},
-                {"§d全类型无限", "§7仅物品/流体·存入即无限"}
+                {"gui.ae2addon.cell.mode1.name", "gui.ae2addon.cell.mode1.desc"},
+                {"gui.ae2addon.cell.mode2.name", "gui.ae2addon.cell.mode2.desc"},
+                {"gui.ae2addon.cell.mode3.name", "gui.ae2addon.cell.mode3.desc"}
         };
-        tooltip.add(Component.literal("模式: " + info[m][0]));
-        tooltip.add(Component.literal(info[m][1]));
+        tooltip.add(Component.translatable("gui.ae2addon.cell.mode", Component.translatable(info[m][0])));
+        tooltip.add(Component.translatable(info[m][1]));
 
         // Mode 3 直接显示 ∞
         if (m == 3) {
-            tooltip.add(Component.literal("§7字节: §b∞"));
-            tooltip.add(Component.literal("§7类型: §b∞"));
-            tooltip.add(Component.literal("§7限制: §e仅物品和流体类型"));
-            tooltip.add(Component.literal("§7右键切换模式"));
+            tooltip.add(Component.translatable("gui.ae2addon.cell.bytes", "∞"));
+            tooltip.add(Component.translatable("gui.ae2addon.cell.types", "∞"));
+            tooltip.add(Component.translatable("gui.ae2addon.cell.limit"));
+            tooltip.add(Component.translatable("gui.ae2addon.cell.switch_hint"));
             return;
         }
 
         // Mode 1 / 2：从统计摘要标签读（轻量，不遍历几千条 NBT）
-        long totalBytes = tag.getLong("_b");
+        BigInteger totalBytes;
+        if (tag.contains("_b2", 7)) {
+            totalBytes = new BigInteger(tag.getByteArray("_b2"));
+        } else {
+            totalBytes = BigInteger.valueOf(tag.getLong("_b"));
+        }
         int typeCount = tag.getInt("_t");
 
-        tooltip.add(Component.literal("§7字节: §b" + formatBytes(totalBytes)));
-        tooltip.add(Component.literal("§7类型: §b" + typeCount));
-        tooltip.add(Component.literal("§7右键切换模式"));
+        tooltip.add(Component.translatable("gui.ae2addon.cell.bytes", formatBytes(totalBytes)));
+        tooltip.add(Component.translatable("gui.ae2addon.cell.types", typeCount));
+        tooltip.add(Component.translatable("gui.ae2addon.cell.switch_hint"));
     }
 
-    private String formatBytes(long bytes) {
-        if (bytes >= 1_000_000_000_000_000_000L) return String.format("%.1fE", bytes / 1_000_000_000_000_000_000.0);
-        if (bytes >= 1_000_000_000_000_000L) return String.format("%.1fP", bytes / 1_000_000_000_000_000.0);
-        if (bytes >= 1_000_000_000_000L) return String.format("%.1fT", bytes / 1_000_000_000_000.0);
-        if (bytes >= 1_000_000_000) return String.format("%.1fG", bytes / 1_000_000_000.0);
-        if (bytes >= 1_000_000) return String.format("%.1fM", bytes / 1_000_000.0);
-        if (bytes >= 1_000) return (bytes / 1_000) + "K";
-        return bytes + "B";
+    /** BigInteger 版字节格式化：支持 B/K/M/G/T/P/E/Z/Y/R/Q 单位 */
+    private String formatBytes(BigInteger bytes) {
+        if (bytes.signum() < 0) return "0B";
+        String[] units = {"B", "K", "M", "G", "T", "P", "E", "Z", "Y", "R", "Q"};
+        BigInteger base = BigInteger.valueOf(1000);
+        BigInteger v = bytes;
+        int u = 0;
+        while (u < units.length - 1 && v.compareTo(base) >= 0) {
+            v = v.divide(base);
+            u++;
+        }
+        // 保留一位小数的近似（显示友好）
+        if (u > 0) {
+            // 用 BigDecimal 算一位小数
+            java.math.BigDecimal bd = new java.math.BigDecimal(bytes);
+            java.math.BigDecimal div = java.math.BigDecimal.valueOf(1000).pow(u);
+            bd = bd.divide(div, 1, java.math.RoundingMode.DOWN);
+            return bd.toPlainString() + units[u];
+        }
+        return v + units[u];
     }
 
 
