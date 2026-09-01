@@ -4,7 +4,7 @@ license="LGPL-3.0"
 
 [[mods]]
 modId="ae2addon"
-version="1.1.0"
+version="1.2.3"
 displayName="AE2 Addon — Infinite Expansion"
 logoFile="logo.png"
 credits="Made with ❤️ by Tendo Alice and sensei ✨"
