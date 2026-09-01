@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="45%" r="75%">
+      <stop offset="0%" stop-color="#111c42"/>
+      <stop offset="55%" stop-color="#0a0f24"/>
+      <stop offset="100%" stop-color="#050812"/>
+    </radialGradient>
+    <radialGradient id="halo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.12"/>
+      <stop offset="60%" stop-color="#0e7490" stop-opacity="0.05"/>
+      <stop offset="100%" stop-color="#0e7490" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#bg)"/>
+  <rect width="512" height="512" fill="url(#halo)"/>
+
+  <!-- 徽章外框：细线六边形（背景层，低存在感） -->
+  <g fill="none" stroke="#1e3060" stroke-width="2.5" opacity="0.9">
+    <path d="M 256,42 L 441,149 L 441,363 L 256,470 L 71,363 L 71,149 Z"/>
+  </g>
+  <g fill="#22d3ee" opacity="0.45">
+    <circle cx="256" cy="42" r="5"/><circle cx="441" cy="149" r="5"/>
+    <circle cx="441" cy="363" r="5"/><circle cx="256" cy="470" r="5"/>
+    <circle cx="71" cy="363" r="5"/><circle cx="71" cy="149" r="5"/>
+  </g>
+
+  <!-- 电路 ∞：方环走线 + 45° 交叉斜线，线宽 13 -->
+  <g fill="none" stroke="#22d3ee" stroke-width="13" stroke-linejoin="miter">
+    <!-- 左方环 -->
+    <path d="M 152,132 H 66 Q 52,132 52,146 V 366 Q 52,380 66,380 H 152 Q 166,380 166,366 V 146 Q 166,132 152,132 Z"/>
+    <!-- 右方环（镜像） -->
+    <path d="M 360,132 H 446 Q 460,132 460,146 V 366 Q 460,380 446,380 H 360 Q 346,380 346,366 V 146 Q 346,132 360,132 Z"/>
+  </g>
+  <!-- 交叉段（穿过中心的能量线，深青 + 白芯） -->
+  <g fill="none" stroke-linecap="round">
+    <path d="M 200,205 L 312,307" stroke="#0e7490" stroke-width="13"/>
+    <path d="M 312,205 L 200,307" stroke="#0e7490" stroke-width="13"/>
+    <path d="M 206,211 L 306,301" stroke="#67e8f9" stroke-width="4" opacity="0.85"/>
+    <path d="M 306,211 L 206,301" stroke="#67e8f9" stroke-width="4" opacity="0.85"/>
+  </g>
+  <!-- 走线节点：过孔圆点 -->
+  <g fill="#67e8f9">
+    <circle cx="66" cy="256" r="9"/><circle cx="446" cy="256" r="9"/>
+    <circle cx="109" cy="146" r="7"/><circle cx="403" cy="366" r="7"/>
+  </g>
+  <g fill="#ffffff" opacity="0.9">
+    <circle cx="66" cy="256" r="3"/><circle cx="446" cy="256" r="3"/>
+    <circle cx="109" cy="146" r="2.5"/><circle cx="403" cy="366" r="2.5"/>
+  </g>
+
+  <!-- 中央能量核（焦点）：菱形白热，盖住交叉点 -->
+  <circle cx="256" cy="256" r="76" fill="#07303f" opacity="0.95"/>
+  <defs>
+    <radialGradient id="coreC" gradientUnits="userSpaceOnUse" cx="242" cy="240" r="80">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="30%" stop-color="#c7f7ff"/>
+      <stop offset="70%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0b5e75"/>
+    </radialGradient>
+  </defs>
+  <path d="M 256,196 L 318,256 L 256,316 L 194,256 Z" fill="url(#coreC)"/>
+  <path d="M 256,222 L 286,256 L 256,290 L 226,256 Z" fill="#ffffff" opacity="0.55"/>
+</svg>

@@ -1,0 +1,7 @@
+【CurseForge 手动上传清单】
+1. 打开项目页 (curseforge.com/minecraft/mc-mods/<slug>) → Files → Upload File
+2. 文件: E:\改着玩\AE2-Infinite-Expansion\build\libs\ae2-addon.jar (856KB, 已含新图标)
+3. Minecraft 版本: 1.21.1
+4. Mod Loader: NeoForge 21.1.x
+5. 发布类型: Release
+6. Changelog: 粘贴 icon-concepts\CHANGELOG-curseforge.md 内容
