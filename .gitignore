@@ -21,3 +21,6 @@ Thumbs.db
 
 # Local
 local.properties
+
+# gradle wrapper jar must be tracked
+!gradle/wrapper/gradle-wrapper.jar
