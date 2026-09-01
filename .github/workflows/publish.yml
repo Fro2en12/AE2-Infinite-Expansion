@@ -21,7 +21,9 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
       - name: Build mod jar
-        run: ./gradlew build --no-daemon
+        run: |
+          chmod +x gradlew
+          ./gradlew build --no-daemon
       - name: Publish to CurseForge
         uses: Kira-NT/mc-publish@v3
         with:
