@@ -27,3 +27,7 @@ local.properties
 
 # 图标设计过程稿，已移到工作区 _design-archive，不入库
 icon-concepts/
+
+# 备份文件不入库
+*.bak
+*.bak-*
