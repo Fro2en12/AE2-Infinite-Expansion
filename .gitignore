@@ -24,3 +24,9 @@ local.properties
 
 # gradle wrapper jar must be tracked
 !gradle/wrapper/gradle-wrapper.jar
+
+# 图标设计过程稿，已移到工作区 _design-archive，不入库
+icon-concepts/
+# 备份文件不入库
+*.bak
+*.bak-*
