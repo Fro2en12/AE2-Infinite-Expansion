@@ -2,25 +2,23 @@
   "type": "minecraft:crafting_shaped",
   "group": "ae2addon",
   "pattern": [
+    "FSF",
     "SHS",
-    "CEC",
-    "SHS"
+    "FSF"
   ],
   "key": {
+    "F": {
+      "item": "ae2:fluix_crystal"
+    },
     "S": {
-      "item": "ae2:singularity"
+      "item": "ae2:1k_crafting_storage"
     },
     "H": {
-      "item": "minecraft:hopper"
-    },
-    "C": {
-      "item": "minecraft:chest"
-    },
-    "E": {
       "item": "ae2addon:eternal_heart"
     }
   },
   "result": {
-    "item": "ae2addon:universal_storage_cell"
+    "id": "ae2addon:infinite_crafting_storage",
+    "count": 1
   }
 }

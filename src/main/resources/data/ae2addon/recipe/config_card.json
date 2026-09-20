@@ -10,6 +10,7 @@
     }
   ],
   "result": {
-    "item": "ae2addon:config_card"
+    "id": "ae2addon:config_card",
+    "count": 1
   }
 }

@@ -2,22 +2,23 @@
   "type": "minecraft:crafting_shaped",
   "group": "ae2addon",
   "pattern": [
-    "FAF",
+    "SAS",
     "AHA",
-    "FAF"
+    "SAS"
   ],
   "key": {
-    "F": {
-      "item": "ae2:fluix_crystal"
+    "S": {
+      "item": "ae2addon:infinite_crafting_storage"
     },
     "A": {
-      "item": "ae2:crafting_accelerator"
+      "item": "ae2addon:infinite_co_processing"
     },
     "H": {
       "item": "ae2addon:eternal_heart"
     }
   },
   "result": {
-    "item": "ae2addon:infinite_co_processing"
+    "id": "ae2addon:integrated_cpu",
+    "count": 1
   }
 }
