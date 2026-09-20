@@ -2,6 +2,7 @@ package com.ae2addon.gui;
 
 import appeng.api.crafting.PatternDetailsHelper;
 import appeng.menu.locator.MenuLocators;
+import com.ae2addon.block.FeederHost;
 import com.ae2addon.block.InfiniteInterfaceBE;
 import com.ae2addon.init.ModMenuTypes;
 import com.ae2addon.network.FeederStatusPacket;
@@ -26,7 +27,7 @@ import java.util.List;
  */
 public class InfiniteInterfaceMenu extends AbstractContainerMenu {
 
-    private final InfiniteInterfaceBE feeder;
+    private final FeederHost feeder;
 
     /** 打开菜单的玩家（服务端广播用；AbstractContainerMenu 无 getPlayer()）。 */
     private final Player opener;
@@ -46,7 +47,7 @@ public class InfiniteInterfaceMenu extends AbstractContainerMenu {
     /** 服务端：上次发送的状态指纹（变化检测，防高频刷包）。 */
     private String lastStatusKey = "";
 
-    public InfiniteInterfaceMenu(int id, Inventory playerInventory, InfiniteInterfaceBE feeder) {
+    public InfiniteInterfaceMenu(int id, Inventory playerInventory, FeederHost feeder) {
         super(ModMenuTypes.INFINITE_INTERFACE.get(), id);
         this.feeder = feeder;
         this.opener = playerInventory.player;
@@ -204,14 +205,19 @@ public class InfiniteInterfaceMenu extends AbstractContainerMenu {
     public static InfiniteInterfaceMenu fromNetwork(int id, Inventory playerInventory,
             RegistryFriendlyByteBuf buffer) {
         var locator = MenuLocators.readFromPacket(buffer);
-        var host = locator.locate(playerInventory.player, InfiniteInterfaceBE.class);
+        Object host = locator.locate(playerInventory.player, InfiniteInterfaceBE.class);
         if (host == null) {
-            throw new IllegalStateException("Could not locate InfiniteInterfaceBE host");
+            // 线缆面板 part 形态（2026-09-02）
+            host = locator.locate(playerInventory.player,
+                    (Class) com.ae2addon.part.InfiniteInterfacePart.class);
         }
-        return new InfiniteInterfaceMenu(id, playerInventory, host);
+        if (host == null) {
+            throw new IllegalStateException("Could not locate feeder host");
+        }
+        return new InfiniteInterfaceMenu(id, playerInventory, (FeederHost) host);
     }
 
-    public InfiniteInterfaceBE getFeeder() {
+    public FeederHost getFeeder() {
         return feeder;
     }
 
@@ -248,8 +254,8 @@ public class InfiniteInterfaceMenu extends AbstractContainerMenu {
             net.minecraft.world.inventory.ClickType clickType, Player player) {
         if (clickType == net.minecraft.world.inventory.ClickType.PICKUP
                 && button == 1 && slotId >= markerSlotStart() && slotId < markerSlotEnd()) {
-            if (feeder.handleMarkerRightClick(slotId - markerSlotStart(), getCarried())) {
-                return; // 已作为标记处理，跳过原版拆分/放置
+            if (feeder.handleMarkerClick(slotId - markerSlotStart(), getCarried(), true)) {
+                return; // 右键：容器内容物优先；已作为标记处理，跳过原版拆分/放置
             }
         }
         // 中键点击标记槽 = 循环切换该标记的独立缓存目标
@@ -272,9 +278,9 @@ public class InfiniteInterfaceMenu extends AbstractContainerMenu {
         if (slotId >= markerSlotStart() && slotId < markerSlotEnd()
                 && !getCarried().isEmpty()
                 && clickType == net.minecraft.world.inventory.ClickType.PICKUP) {
-            // 左键放入 = 标记（与右键一致）；不放物品进槽
-            if (button == 0 && feeder.handleMarkerRightClick(
-                    slotId - markerSlotStart(), getCarried())) {
+            // 左键放入 = 标记容器/物品本体（与右键区分：右键容器内容物优先，2026-09-02）
+            if (button == 0 && feeder.handleMarkerClick(
+                    slotId - markerSlotStart(), getCarried(), false)) {
                 return;
             }
         }
@@ -310,25 +316,29 @@ public class InfiniteInterfaceMenu extends AbstractContainerMenu {
             if (!moveItemStackTo(stack, upgradeEnd, hotbarEnd, true)) {
                 return ItemStack.EMPTY;
             }
-        } else if (slotIndex < toolboxEnd) {
-            // 网络工具卡槽：优先 → 接口升级槽（90..98）；其次 → 玩家背包
+        } else if (slotIndex < invEnd) {
+            // 玩家主格 99..125 → 自动归类（2026-09-06 sensei 优化）：
+            // 已编码样板 → 样板槽；升级卡 → 升级槽。标记槽不收真实物品。
+            boolean autoPlaced = autoClassify(stack, patternEnd, upgradeEnd);
+            if (!autoPlaced && !stack.isEmpty()) {
+                // 背包内移动兜底：主格 → 快捷栏
+                if (!moveItemStackTo(stack, invEnd, hotbarEnd, false)) {
+                    return ItemStack.EMPTY;
+                }
+            }
+        } else if (slotIndex < hotbarEnd) {
+            // 快捷栏 126..134 → 自动归类；兜底移到主格
+            boolean autoPlaced = autoClassify(stack, patternEnd, upgradeEnd);
+            if (!autoPlaced && !stack.isEmpty()) {
+                if (!moveItemStackTo(stack, upgradeEnd, invEnd, false)) {
+                    return ItemStack.EMPTY;
+                }
+            }
+        } else {
+            // 网络工具卡槽 135..143：优先 → 接口升级槽（90..98）；其次 → 玩家背包
             if (!moveItemStackTo(stack, upgradeEnd - 9, upgradeEnd, false)
                     && !moveItemStackTo(stack, upgradeEnd, invEnd, false)
                     && !moveItemStackTo(stack, invEnd, hotbarEnd, false)) {
-                return ItemStack.EMPTY;
-            }
-        } else {
-            // 玩家背包 → 样板槽（仅已编码样板）；标记槽不收真实物品（虚拟标记，
-            // shift 移入会卡死被吞——2026-08-28 BUG，改为不放）
-            if (PatternDetailsHelper.isEncodedPattern(stack)
-                    && !moveItemStackTo(stack, 0, patternEnd, false)) {
-                return ItemStack.EMPTY;
-            }
-            // 背包内移动（避免卡死）
-            if (!stack.isEmpty() && slotIndex >= invEnd && !moveItemStackTo(stack, upgradeEnd, invEnd, false)) {
-                return ItemStack.EMPTY;
-            }
-            if (!stack.isEmpty() && slotIndex < invEnd && !moveItemStackTo(stack, invEnd, hotbarEnd, false)) {
                 return ItemStack.EMPTY;
             }
         }
@@ -342,6 +352,22 @@ public class InfiniteInterfaceMenu extends AbstractContainerMenu {
         }
         slot.onTake(player, stack);
         return original;
+    }
+
+    /**
+     * shift+点击自动归类（2026-09-06 sensei 优化，上游 v1.3.0 同步）：
+     * 已编码样板 → 样板槽（0..patternEnd）；升级卡 → 升级槽。
+     *
+     * @return 是否至少移入一部分
+     */
+    private boolean autoClassify(ItemStack stack, int patternEnd, int upgradeEnd) {
+        if (PatternDetailsHelper.isEncodedPattern(stack)) {
+            return moveItemStackTo(stack, 0, patternEnd, false);
+        }
+        if (appeng.api.upgrades.Upgrades.isUpgradeCardItem(stack.getItem())) {
+            return moveItemStackTo(stack, upgradeEnd - 9, upgradeEnd, false);
+        }
+        return false;
     }
 
     @Override
@@ -383,13 +409,13 @@ public class InfiniteInterfaceMenu extends AbstractContainerMenu {
         }
         lines.add(json(Component.translatable("gui.ae2addon.feeder.target", machine)));
         lines.add(json(Component.translatable("gui.ae2addon.feeder.switch",
-                Component.translatable(feeder.activeExtract
+                Component.translatable(feeder.activeExtract()
                         ? "gui.ae2addon.feeder.on" : "gui.ae2addon.feeder.off"),
                 Component.translatable("gui.ae2addon.side."
-                        + feeder.extractSide.name().toLowerCase(java.util.Locale.ROOT)),
-                Component.translatable(feeder.activeFeed
+                        + feeder.extractSide().name().toLowerCase(java.util.Locale.ROOT)),
+                Component.translatable(feeder.activeFeed()
                         ? "gui.ae2addon.feeder.on" : "gui.ae2addon.feeder.off"),
-                Component.translatable(feeder.activeMarkerFeed
+                Component.translatable(feeder.activeMarkerFeed()
                         ? "gui.ae2addon.feeder.on" : "gui.ae2addon.feeder.off"))));
         lines.add(json(Component.translatable("gui.ae2addon.feeder.params",
                 feeder.stockTargetValue(), feeder.restockIntervalValue(), feeder.feedBudgetValue())));

@@ -3,6 +3,8 @@ package com.ae2addon.mixin;
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.networking.crafting.ICraftingProvider;
 import appeng.api.networking.energy.IEnergyService;
+import appeng.api.stacks.AEKey;
+import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.execution.CraftingCpuHelper;
 import appeng.crafting.execution.CraftingCpuLogic;
@@ -317,6 +319,23 @@ public abstract class CraftingCpuLogicMixin {
                 ae2addon$batchLocked.clear();
                 if (currentJob != null) {
                     com.ae2addon.block.InfiniteInterfaceBE.resetPushedFor(cluster);
+                    // 2026-09-20 本地增强（上游 v1.3.0 未接面板回退链）：面板形态同步清账。
+                    // 方块版在「新任务开始」时清掉本簇的推送归属记录（材料留在接口 = 正常交付，
+                    // 归属只服务于当前任务的取消回退）；面板版此前没有对应调用，旧任务的记账会
+                    // 残留到新任务 —— 新任务一旦取消，会把旧任务已正常交付的材料误退回网络。
+                    // 此处与方块版同处同条件（仅集成 CPU 的 job 变更时），行为对齐。
+                    // 防御：同样吞异常，不影响上方方块版清账与上游 tick 流程。
+                    try {
+                        for (com.ae2addon.part.InfiniteInterfacePart part
+                                : com.ae2addon.part.InfiniteInterfacePart.ACTIVE_PARTS) {
+                            if (part != null && !part.isRemoved()) {
+                                part.resetPushedForClusterPublic(cluster);
+                            }
+                        }
+                    } catch (Throwable t) {
+                        AE2Addon.LOGGER.warn(
+                                "[ae2addon][feeder] 面板形态推送归属清理异常（已忽略）", t);
+                    }
                 }
             }
             ae2addon$budgetNanos = ae2addon$getAdaptiveBudgetNanos();
@@ -401,6 +420,20 @@ public abstract class CraftingCpuLogicMixin {
             require = 0)
     private boolean ae2addon$limitTaskIteration(Iterator<?> iterator) {
         com.ae2addon.crafting.CraftingCompat.timeSliceActive = true;
+        // 2026-09-09 上游同步 · 虚拟结算产物回收：settle 返回 true 后外层已完成
+        // waitingFor 记账，此刻回收（AE2 19 insert 需 waitingFor 有记账才冲抵；
+        // 根产物 finishJob 置 job=null → 下面终止迭代）。
+        if (ae2addon$pendingSettle != null && !ae2addon$pendingSettle.isEmpty()) {
+            ae2addon$flushPendingSettle();
+        }
+        // 虚拟结算根产物 finishJob 后 job 已置 null：终止任务迭代。
+        // （AE2 19 字节码 2026-09-09 核对：executeCrafting 在方法头把 job 存进局部变量，
+        //  继续迭代不会 NPE；但 finishJob 已 clear() waitingFor，再 insert 冲抵不到记账
+        //  → 产物丢失，必须终止。）
+        if (ae2addon$settleStopIteration) {
+            ae2addon$settleStopIteration = false;
+            return false;
+        }
         if (ae2addon$budgetActive) {
             ae2addon$diagIterations++;
             if (ae2addon$budgetExceeded()) {
@@ -419,6 +452,12 @@ public abstract class CraftingCpuLogicMixin {
             require = 0)
     private boolean ae2addon$limitProviderIteration(Iterator<?> iterator) {
         com.ae2addon.crafting.CraftingCompat.timeSliceActive = true;
+        // 2026-09-09 上游同步 · 虚拟结算根产物 finishJob 后 job 已置 null：
+        // 终止 provider 迭代（同 limitTaskIteration 的理由）
+        if (ae2addon$settleStopIteration) {
+            ae2addon$settleStopIteration = false;
+            return false;
+        }
         if (ae2addon$budgetActive) {
             ae2addon$diagIterations++;
             if (ae2addon$budgetExceeded()) {
@@ -534,17 +573,44 @@ public abstract class CraftingCpuLogicMixin {
                         patternDetails.getClass().getSimpleName(), n, taskRemaining);
             }
         } else if (ae2addon$isCraftingPattern(patternDetails)) {
-            // 2026-08-22：合成样板（AECraftingPattern）强制 1× 推送。
-            // 合成机器（ExtendedAE PatternCore/普通样板供应器）按单次配方执行，
-            // N× ScaledPattern 输入会导致拒收/错乱（sensei 实测：AECraftingPattern
-            // 单 tick 206 次拒收、任务值卡 1、CPU 永久 busy，阻塞全部后续订单）。
-            // 处理样板（AEProcessingPattern）保留批量推送。
-            n = 1;
-            if (com.ae2addon.crafting.CraftingCompat.debugLogs) {
-                com.ae2addon.AE2Addon.LOGGER.info(
-                        "[ae2addon][debug] 合成样板强制1×: pattern={} batchNext={} taskRemaining={}",
-                        patternDetails,
-                        ae2addon$getBatchMultiplier(patternDetails), taskRemaining);
+            // 2026-08-22：合成族样板（合成/切石/锻造，MA 执行族）强制 1× 推送。
+            // 真实合成机器按单次配方执行，N× ScaledPattern 输入会导致拒收/错乱
+            // （sensei 实测：AECraftingPattern 单 tick 206 次拒收、任务卡 1、CPU
+            // 永久 busy）。处理样板（AEProcessingPattern）保留批量推送。
+            // 2026-09-09 上游同步：虚拟结算激活时改批量（增殖库存感知 / 普通全量）。
+            if (ae2addon$virtualSettleActive(patternDetails)) {
+                if (ae2addon$isSelfReferentialPattern(patternDetails)) {
+                    // 增殖配方（模板复制 a+b=2a，产物与输入同种）：批量 N = 当前
+                    // crafting storage 可用种子量（库存感知）——每轮提取全部可用种子
+                    // → 结算产 2N 回流 → 库存翻倍 → 指数滚雪球（1→2→4→8…），
+                    // 500 次任务只需 ~log2(500)≈9 轮而非 500 轮。
+                    // 种子库存探测用 SIMULATE（不真扣）；提取失败自动减半回退。
+                    long seedCap = ae2addon$probeSelfSeedCap(patternDetails, inventory);
+                    n = Math.min(taskRemaining, Math.max(1, seedCap));
+                    n = Math.min(n, ae2addon$batchMaxMultiplier());
+                    if (CraftingCompat.debugLogs) {
+                        AE2Addon.LOGGER.info(
+                                "[ae2addon][debug] 增殖库存感知批量: pattern={} taskRemaining={} seedCap={} n={}",
+                                patternDetails, taskRemaining, seedCap, n);
+                    }
+                } else {
+                    // M1c（2026-09-04）：虚拟结算无真实装配瓶颈 → 一次提取全部任务材料，
+                    // 整层瞬时结算（ScaledPattern multiplyExact 防溢出，溢出自动回退 1×）
+                    n = Math.min(taskRemaining, ae2addon$batchMaxMultiplier());
+                    if (CraftingCompat.debugLogs) {
+                        AE2Addon.LOGGER.info(
+                                "[ae2addon][debug] 合成族样板虚拟结算全量: pattern={} n={} taskRemaining={}",
+                                patternDetails, n, taskRemaining);
+                    }
+                }
+            } else {
+                n = 1;
+                if (CraftingCompat.debugLogs) {
+                    AE2Addon.LOGGER.info(
+                            "[ae2addon][debug] 合成族样板强制1×: pattern={} batchNext={} taskRemaining={}",
+                            patternDetails,
+                            ae2addon$getBatchMultiplier(patternDetails), taskRemaining);
+                }
             }
         }
         if (n <= 1) {
@@ -565,6 +631,11 @@ public abstract class CraftingCpuLogicMixin {
                         "[ae2addon][debug] 1x提取(节流): 产出={} 结果={} inv={}",
                         io, result1x == null ? "null(失败)" : "成功",
                         inventory == null ? "null" : inventory.getClass().getSimpleName());
+                // 2026-09-09 上游同步 · 增殖诊断：提取失败节流打印 crafting storage 全量
+                // + 输入组明细（每 512 次提取失败打一次，防刷屏）
+                if (result1x == null && (ae2addon$diagExtractLogCount & 0x1FF) == 0) {
+                    ae2addon$dumpInventoryDiag(patternDetails, inventory);
+                }
             }
             return result1x;
         }
@@ -616,15 +687,122 @@ public abstract class CraftingCpuLogicMixin {
     }
 
     /**
-     * 是否为合成样板（crafting pattern）：此类配方强制 1× 推送（见 extractBatch）。
+     * 是否为合成族样板（crafting pattern）：非虚拟结算时强制 1× 推送（见 extractBatch）。
      * 按类名判断（不引用具体类，兼容 AE2 民间重置版/gtlcore 改名）。
+     * 2026-09-09 上游同步：族范围从 AECraftingPattern 扩到合成/切石/锻造
+     * （切石/锻造也要走虚拟结算，sensei 2026-09-04 需求）。
      */
     @Unique
     private static boolean ae2addon$isCraftingPattern(IPatternDetails pattern) {
         if (pattern == null) {
             return false;
         }
-        return pattern.getClass().getName().endsWith("AECraftingPattern");
+        String name = pattern.getClass().getName();
+        return !name.endsWith("AEProcessingPattern")
+                && (name.endsWith("AECraftingPattern")
+                        || name.endsWith("AEStonecuttingPattern")
+                        || name.endsWith("AESmithingTablePattern")
+                        || name.contains("CraftingPattern"));
+    }
+
+    /**
+     * 自指/增殖配方判定（2026-09-09 上游同步）：产物与输入包含同种 key——
+     * 如模板复制 1模板+7钻+1下界岩→2模板。此类配方全量批量需要 N 个自身
+     * 种子备料（备不齐）→ 只能靠产物倍增滚雪球，批量 N 由可用种子量驱动。
+     */
+    @Unique
+    private static boolean ae2addon$isSelfReferentialPattern(IPatternDetails pattern) {
+        if (pattern == null) {
+            return false;
+        }
+        var outs = pattern.getOutputs();
+        if (outs == null || outs.isEmpty()) {
+            return false;
+        }
+        var inputs = pattern.getInputs();
+        if (inputs == null) {
+            return false;
+        }
+        for (var inGroup : inputs) {
+            if (inGroup == null || inGroup.getPossibleInputs() == null) {
+                continue;
+            }
+            for (var gs : inGroup.getPossibleInputs()) {
+                if (gs == null || gs.what() == null) {
+                    continue;
+                }
+                for (var out : outs) {
+                    if (out != null && out.what() != null
+                            && out.what().equals(gs.what())) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 增殖批量种子上限探测（2026-09-09 上游同步提速）：返回「当前 crafting storage 中
+     * 可提取的自指种子量 ÷ 每份执行消耗量」。增殖每轮提取全部可用种子 → 结算
+     * 产 2N 回流 → 库存翻倍，批量 N 跟随即可指数滚雪球。探测 SIMULATE 不真扣。
+     */
+    @Unique
+    private long ae2addon$probeSelfSeedCap(IPatternDetails patternDetails,
+            ICraftingInventory inventory) {
+        try {
+            if (patternDetails == null || inventory == null) {
+                return 1;
+            }
+            var outs = patternDetails.getOutputs();
+            if (outs == null || outs.isEmpty()) {
+                return 1;
+            }
+            for (var out : outs) {
+                if (out == null || out.what() == null) {
+                    continue;
+                }
+                AEKey key = out.what();
+                // 每份执行消耗该种子的量（amount × mult 累加，防御多组重复）
+                long perUse = 0;
+                boolean inInput = false;
+                var inputs = patternDetails.getInputs();
+                if (inputs != null) {
+                    for (var inGroup : inputs) {
+                        if (inGroup == null || inGroup.getPossibleInputs() == null) {
+                            continue;
+                        }
+                        long groupUse = 0;
+                        boolean groupHas = false;
+                        for (var gs : inGroup.getPossibleInputs()) {
+                            if (gs != null && gs.what() != null
+                                    && gs.what().equals(key)) {
+                                groupHas = true;
+                                groupUse = Math.max(groupUse, gs.amount());
+                            }
+                        }
+                        if (groupHas) {
+                            inInput = true;
+                            perUse += groupUse
+                                    * Math.max(1, inGroup.getMultiplier());
+                        }
+                    }
+                }
+                if (!inInput || perUse <= 0) {
+                    continue;
+                }
+                // SIMULATE 探测可提取量（不真扣）
+                long avail = inventory.extract(key, Long.MAX_VALUE,
+                        appeng.api.config.Actionable.SIMULATE);
+                if (avail <= 0) {
+                    return 0;
+                }
+                return Math.max(0, avail / perUse);
+            }
+            return 1;
+        } catch (Throwable t) {
+            return 1;
+        }
     }
 
     /**
@@ -650,7 +828,40 @@ public abstract class CraftingCpuLogicMixin {
      */
     @Inject(method = "cancel", at = @At("HEAD"), require = 0)
     private void ae2addon$onCraftingCancelled(CallbackInfo callback) {
+        // 2026-09-09 上游同步 · 诊断（上游 2026-09-06「蓄水池被清」排查）：谁在取消任务
+        if (CraftingCompat.debugLogs) {
+            StackTraceElement[] st = Thread.currentThread().getStackTrace();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 2; i < Math.min(st.length, 8); i++) {
+                sb.append(st[i].toString()).append(" <- ");
+            }
+            AE2Addon.LOGGER.info(
+                    "[ae2addon][feeder][diag] CPU任务cancel触发: {}", sb);
+        }
         com.ae2addon.block.InfiniteInterfaceBE.returnPushedFor(cluster);
+
+        // ── 2026-09-20 本地增强（上游 v1.3.0 未接面板回退链）──
+        // 方块形态（InfiniteInterfaceBE）与线缆面板形态（InfiniteInterfacePart）共用同一条
+        // CPU 取消链：两者的 pushPattern 都按 CraftingCompat.currentPushingCluster 记账，
+        // 键就是本 Mixin 的 cluster 实例。但上游只遍历方块版静态注册表 ACTIVE，面板版
+        // ACTIVE_PARTS 全程无人调用 → 面板形态下取消任务时材料留在面板蓄水池，不像方块版
+        // 那样退回网络（上游 1.20.1 同样未接，故此处为本地补链）。两种形态缺一不可。
+        // 行为影响：CPU 任务取消 → 该面板把本簇推送且尚未喂出的材料插回其所在网格。同网格
+        // 判定与方块版一致：不做额外 grid 过滤，只按 cluster 键匹配，各面板用自己
+        // getMainNode().getGrid() 的网络退料；未退完的记账由面板 retryPendingReturns
+        // 每 20 tick 续退（面板侧不丢料加固，方块版无此重试）。
+        // 防御：面板遍历/退料异常一律吞掉，绝不影响上方方块版回退与上游 cancel 流程。
+        try {
+            for (com.ae2addon.part.InfiniteInterfacePart part
+                    : com.ae2addon.part.InfiniteInterfacePart.ACTIVE_PARTS) {
+                if (part != null && !part.isRemoved()) {
+                    part.returnPushedForClusterPublic(cluster);
+                }
+            }
+        } catch (Throwable t) {
+            AE2Addon.LOGGER.warn(
+                    "[ae2addon][feeder] 面板形态取消回退异常（已忽略，不影响方块版回退）", t);
+        }
     }
 
     // ── 批量推送：push 阶段 ──
@@ -669,6 +880,30 @@ public abstract class CraftingCpuLogicMixin {
     private boolean ae2addon$pushBatch(ICraftingProvider provider,
             IPatternDetails patternDetails, KeyCounter[] inputs) {
         ae2addon$diagPushCalls++;
+        // ── 虚拟结算（v0.3 M1，2026-09-09 上游同步）：合成类样板节点不真实装配 ──
+        // 材料已在 extract 阶段从 crafting storage 提取（销毁 ✓）；产物走原版 insert
+        // 回收通道瞬时注入：根产物→CraftingLink+finishJob；中间产物→crafting storage 供上层。
+        if (ae2addon$virtualSettleActive(patternDetails)) {
+            return ae2addon$virtualSettle(patternDetails);
+        }
+        // ── 共享成功派发预算（2026-09-08 上游同步，学 ae2lt 双预算思想）：预算耗尽时拒绝
+        // 本次 push（返回 false 模拟 provider 拒绝，AE2 正常退避），防止多个巨型订单同
+        // tick 抢占把服务端拖垮。仅限集成 CPU（budgetActive）真实 push 计费；
+        // 原版 CPU 与虚拟结算不占预算。
+        boolean budgetReserved = false;
+        if (ae2addon$budgetActive
+                && CraftingCompat.dispatchBudgetPerTick > 0) {
+            if (!CraftingCompat.tryConsumeDispatch()) {
+                if (CraftingCompat.debugLogs) {
+                    AE2Addon.LOGGER.info(
+                            "[ae2addon][debug] 共享派发预算耗尽，拒绝 push (provider={}, 已用={})",
+                            provider == null ? "null" : provider.getClass().getSimpleName(),
+                            CraftingCompat.dispatchUsedThisTick());
+                }
+                return false;
+            }
+            budgetReserved = true; // push 失败会退回配额
+        }
         if (!ae2addon$batchActive
                 || ae2addon$batchBasePattern == null
                 || !ae2addon$batchBasePattern.equals(patternDetails)
@@ -697,6 +932,9 @@ public abstract class CraftingCpuLogicMixin {
                 ae2addon$onBatchAccepted(patternDetails, 1L);
             } else if (!accepted && patternDetails != null) {
                 ae2addon$recordStuck(patternDetails);
+            }
+            if (!accepted && budgetReserved) {
+                CraftingCompat.refundDispatch(); // push失败退配额（2026-09-09 上游同步）
             }
             return accepted;
         }
@@ -743,8 +981,335 @@ public abstract class CraftingCpuLogicMixin {
             // provider 接受时不该减半，收敛仍交给 pending 逻辑）。
             ae2addon$diagBatchRejected++;
             ae2addon$recordStuck(patternDetails);
+            if (budgetReserved) {
+                CraftingCompat.refundDispatch(); // push失败退配额（2026-09-09 上游同步）
+            }
         }
         return accepted;
+    }
+
+    // ── 虚拟结算（v0.3 M1，2026-09-09 上游同步）──
+    // 上游（AE2 15 / 1.20.1）行为：合成族样板节点不真实装配——材料已在 extract 阶段
+    // 从 crafting storage 提取（= 销毁），产物登记到 pendingSettle，返回 true 让外层
+    // 完成 waitingFor 记账，待任务循环 hasNext 处（记账已发生）调原版 insert 回收。
+    // 本地 1.21.1 / AE2 19 适配点：
+    //   · IPatternDetails.getOutputs() 返回 List（非数组）→ isEmpty()/get(0)
+    //   · CraftingCpuLogic.insert 返回 long（原 void），忽略返回值即可
+    //   · getInputs() 仍是数组，上游写法可直接用
+    //   · 装配处理器模块（com.ae2addon.block.AssemblerRegistry / AssemblerCoreBE）
+    //     按上游原文直连（moduleFor(owner) + declares(pattern)；2026-09-09 主 agent 决策）。
+
+    /** 虚拟结算后根产物 finishJob 置 job=null，需终止本 tick 任务迭代（见 limitTaskIteration）。 */
+    @Unique
+    private boolean ae2addon$settleStopIteration;
+
+    /**
+     * 待回收产物（key→量）：settle 返回 true 后外层才把产物记入 waitingFor；
+     * insert 只在 waitingFor 有记账时冲抵（AE2 19 字节码 2026-09-09 核对），所以产物
+     * 回收必须推迟到记账完成后——在任务循环 hasNext 处执行（此时记账已发生）。
+     */
+    @Unique
+    private KeyCounter ae2addon$pendingSettle;
+
+    /**
+     * 当前待回收产物是否来自自指配方（增殖，模板复制类）：是则 root 产物
+     * 回流 crafting storage 供下一轮 extract 滚雪球，而非物理入网——
+     * 自指任务的 root 同时也是后续轮次的输入种子（上游 2026-09-06）。
+     */
+    @Unique
+    private boolean ae2addon$pendingSettleSelfRef;
+
+    /** 虚拟结算判定日志节流 tick（debugLogs 时每 tick 最多一条）。 */
+    @Unique
+    private long ae2addon$diagSettleTick = Long.MIN_VALUE;
+
+    /**
+     * 判定（v0.3 M3）：仅限合成族样板（合成/切石/锻造，非处理类）；且当前 CPU 簇的
+     * 集成 CPU（主簇或虚拟 lane）挂了装配处理器模块并声明了该样板（样板槽白名单）
+     * 才虚拟结算。无模块/未声明 → 一律真实合成。
+     */
+    @Unique
+    private boolean ae2addon$virtualSettleActive(IPatternDetails patternDetails) {
+        if (patternDetails == null || !ae2addon$isCraftingPattern(patternDetails)) {
+            return false;
+        }
+        var owner = com.ae2addon.block.IntegratedCPURegistry.ownerOf(cluster);
+        var module = com.ae2addon.block.AssemblerRegistry.moduleFor(owner);
+        boolean declared = module != null && module.declares(patternDetails);
+        if (CraftingCompat.debugLogs) {
+            // 诊断（上游 2026-09-04 锻造/切石不虚拟排查）：每 tick 一条
+            long tick = TickHandler.instance().getCurrentTick();
+            if (ae2addon$diagSettleTick != tick) {
+                ae2addon$diagSettleTick = tick;
+                String out = "?";
+                try {
+                    var outs = patternDetails.getOutputs();
+                    if (outs != null && !outs.isEmpty() && outs.get(0) != null
+                            && outs.get(0).what() != null) {
+                        out = outs.get(0).what().toString();
+                    }
+                } catch (RuntimeException ignored) {
+                }
+                AE2Addon.LOGGER.info(
+                        "[ae2addon][settle] 判定: pattern={} 产物={} owner={} module={} declared={} 簇@{} 模块槽0={}",
+                        patternDetails.getClass().getSimpleName(), out,
+                        owner == null ? "null" : "cpu",
+                        module == null ? "null" : module.getBlockPos().toShortString(),
+                        declared, System.identityHashCode(cluster),
+                        module == null ? "-" : module.getSlot(0).getHoverName().getString());
+            }
+        }
+        return declared;
+    }
+
+    /**
+     * 虚拟结算：不真实装配（跳过 provider.pushPattern），材料已由 extract 阶段扣出
+     * （= 销毁）。产物登记到 pendingSettle，返回 true 让外层记账（waitingFor += 产物），
+     * 待任务循环 hasNext 处（记账后）调原版 insert 回收：
+     * - 根产物（finalOutput 匹配）→ CraftingLink 送达请求者 + remainingAmount 归零 + finishJob
+     * - 中间产物 → crafting storage（AE2 19 insert 内部自己进 inventory），上游节点 extract 直接命中
+     * N× 结算（M1c）：批量上下文激活时按 batchMultiplier 一次结算 N 份（产物×N 入
+     * pendingSettle，任务值补减 N−1）；1× 为回退/非批量路径。
+     */
+    @Unique
+    private boolean ae2addon$virtualSettle(IPatternDetails patternDetails) {
+        try {
+            long n = 1;
+            if (ae2addon$batchActive && ae2addon$batchBasePattern != null
+                    && ae2addon$batchBasePattern.equals(patternDetails)
+                    && ae2addon$batchMultiplier > 1) {
+                n = ae2addon$batchMultiplier;
+            }
+            var outputs = patternDetails.getOutputs();
+            if (outputs == null || outputs.isEmpty()) {
+                return false;
+            }
+            KeyCounter pending = ae2addon$pendingSettle;
+            if (pending == null) {
+                pending = new KeyCounter();
+                ae2addon$pendingSettle = pending;
+            }
+            boolean settledAny = false;
+            for (var out : outputs) {
+                if (out == null || out.what() == null || out.amount() <= 0) {
+                    continue;
+                }
+                settledAny = true;
+                // N× 产物：ScaledPattern 构造时对 inputs/outputs 均 multiplyExact 验溢，
+                // 能走到批量提取说明 n×amount 未溢出（1× 路径无溢出问题）
+                pending.add(out.what(), out.amount() * n);
+            }
+            if (!settledAny) {
+                return false;
+            }
+            // 自指/增殖配方（产物=输入同种）：root 产物需回流 crafting storage
+            // 供下一轮 extract（滚雪球），flush 据此分流（上游 2026-09-06）
+            ae2addon$pendingSettleSelfRef = ae2addon$isSelfReferentialPattern(patternDetails);
+            if (n > 1) {
+                // 任务值补减 n−1（AE2 外层还会 −1，共 −n → 归零移除）；decrementTaskValue
+                // 自带 current<=amount 保护（归零交给 AE2），不重复清批量上下文——
+                // 同 tick 缓存提取二次 push 时仍需按同 N 结算（材料已按 N× 扣出）
+                ae2addon$decrementTaskValue(patternDetails, n - 1);
+            }
+            if (CraftingCompat.debugLogs) {
+                AE2Addon.LOGGER.info(
+                        "[ae2addon][settle] 虚拟结算: pattern={} N={} 产物{}种 → 待回收（外层记账后 insert）",
+                        patternDetails.getClass().getSimpleName(), n, outputs.size());
+            }
+            return true;
+        } catch (Throwable t) {
+            if (CraftingCompat.debugLogs) {
+                AE2Addon.LOGGER.warn("[ae2addon][settle] 虚拟结算异常: {}", t.toString());
+            }
+            return false;
+        }
+    }
+
+    /** 记账后回收 pendingSettle 产物（须在任务循环 hasNext 处调用：此时外层已记账）。
+     *  根产物：先账务（waitingFor 冲抵 + CraftingLink 交割）再物理注入网络存储；
+     *  中间产物：仅账务 insert（AE2 19 的 insert 对非最终产物自行进 crafting storage 供上层 extract）。 */
+    @Unique
+    private void ae2addon$flushPendingSettle() {
+        KeyCounter pending = ae2addon$pendingSettle;
+        if (pending == null || pending.isEmpty()) {
+            return;
+        }
+        ae2addon$pendingSettle = null;
+        boolean selfRef = ae2addon$pendingSettleSelfRef;
+        ae2addon$pendingSettleSelfRef = false;
+        try {
+            AEKey rootKey = ae2addon$getFinalOutputKey();
+            var logic = cluster.craftingLogic;
+            var grid = cluster.getGrid();
+            var networkStorage = grid == null ? null : grid.getStorageService().getInventory();
+            for (var entry : pending) {
+                if (entry == null || entry.getKey() == null || entry.getLongValue() <= 0) {
+                    continue;
+                }
+                AEKey key = entry.getKey();
+                long amount = entry.getLongValue();
+                boolean isRoot = rootKey != null && rootKey.equals(key);
+                // ① 账务先行：waitingFor 冲抵 + finalOutput 匹配 → link.insert 交割尝试
+                // （此时网络还没产物 → requester 提取 0 → 拿不到）+ remainingAmount 归零 +
+                // finishJob。顺序关键（上游 2026-09-04 修复：先入网再账务会让 requester 把
+                // 刚入网的 root 提走——终端请求塞玩家背包、巨型量无处放 → 产物消失网络归零；
+                // sensei 语义：产物注入网络，requester 只是发起方）
+                logic.insert(key, amount, appeng.api.config.Actionable.MODULATE);
+                // ② 产物实体去向：
+                //    - 自指任务（模板复制类）：root 同时也是后续轮次的输入种子 →
+                //      回流 crafting storage（cluster inventory）滚雪球，不入网；
+                //      任务完成时原版把 inventory 富余自动退网络（上游 2026-09-06）
+                //    - 普通任务：root 物理入网（账务后：link 已完成，产物留在网络）
+                if (isRoot && networkStorage != null) {
+                    if (selfRef) {
+                        var inv = logic.getInventory();
+                        if (inv != null) {
+                            inv.insert(key, amount,
+                                    appeng.api.config.Actionable.MODULATE);
+                            if (CraftingCompat.debugLogs) {
+                                AE2Addon.LOGGER.info(
+                                        "[ae2addon][settle] 自指产物回流crafting storage: key={} 量={}（不入网，滚雪球）",
+                                        key, amount);
+                            }
+                        }
+                    } else {
+                        // ⚠️ AE2 insert 返回「已插入量」（非剩余量）——上游 2026-09-04 20:40 修正误报
+                        long insertedAmt = networkStorage.insert(key, amount,
+                                appeng.api.config.Actionable.MODULATE, cluster.getSrc());
+                        if (CraftingCompat.debugLogs) {
+                            AE2Addon.LOGGER.info(
+                                    "[ae2addon][settle] 物理入网(账务后): key={} 期望{} 实插{} root=true",
+                                    key, amount, insertedAmt);
+                        }
+                        if (insertedAmt < amount && CraftingCompat.debugLogs) {
+                            AE2Addon.LOGGER.warn(
+                                    "[ae2addon][settle] 根产物入网部分失败: key={} 已插{} 期望{}（网络满？）",
+                                    key, insertedAmt, amount);
+                        }
+                    }
+                } else if (CraftingCompat.debugLogs && networkStorage != null) {
+                    AE2Addon.LOGGER.info(
+                            "[ae2addon][settle] 中间产物(不入网): key={} 量={} rootKey={}",
+                            key, amount, rootKey);
+                }
+            }
+            if (CraftingCompat.debugLogs) {
+                AE2Addon.LOGGER.info("[ae2addon][settle] 回收完成: {} 种产物已注入（root 已入网）",
+                        pending.size());
+            }
+            // 根产物 insert 触发 finishJob → job 置 null：终止本 tick 任务迭代，防外层 NPE
+            if (ae2addon$getJob() == null) {
+                ae2addon$settleStopIteration = true;
+            }
+        } catch (Throwable t) {
+            if (CraftingCompat.debugLogs) {
+                AE2Addon.LOGGER.warn("[ae2addon][settle] 产物回收异常: {}", t.toString());
+            }
+        }
+    }
+
+    // finalOutput 反射字段缓存
+    @Unique
+    private static volatile java.lang.reflect.Field ae2addon$finalOutputField;
+    @Unique
+    private static volatile boolean ae2addon$finalOutputFieldFailed;
+
+    /** 任务树根产物的 key（无任务/失败返回 null）。 */
+    @Unique
+    private AEKey ae2addon$getFinalOutputKey() {
+        Object job = ae2addon$getJob();
+        if (job == null) {
+            return null;
+        }
+        try {
+            java.lang.reflect.Field field = ae2addon$finalOutputField;
+            if (field == null) {
+                if (ae2addon$finalOutputFieldFailed) {
+                    return null;
+                }
+                try {
+                    field = job.getClass().getDeclaredField("finalOutput");
+                } catch (NoSuchFieldException e) {
+                    field = null;
+                }
+                if (field == null) {
+                    // 类型兜底：唯一 GenericStack 类型字段（AE2 19 ExecutingCraftingJob.finalOutput）
+                    for (java.lang.reflect.Field f : job.getClass().getDeclaredFields()) {
+                        if (GenericStack.class.isAssignableFrom(f.getType())) {
+                            field = f;
+                            break;
+                        }
+                    }
+                }
+                if (field == null) {
+                    ae2addon$finalOutputFieldFailed = true;
+                    return null;
+                }
+                field.setAccessible(true);
+                ae2addon$finalOutputField = field;
+            }
+            Object out = field.get(job);
+            if (!(out instanceof GenericStack gs) || gs.what() == null) {
+                return null;
+            }
+            return gs.what();
+        } catch (RuntimeException | ReflectiveOperationException e) {
+            ae2addon$finalOutputFieldFailed = true;
+            return null;
+        }
+    }
+
+    /**
+     * 2026-09-09 上游同步 · 增殖诊断：打印 crafting storage 全量 + pattern 输入组明细。
+     * 定位「结算若干次后 1x 提取永久失败」的缺料/失配根因。
+     */
+    @Unique
+    private void ae2addon$dumpInventoryDiag(IPatternDetails patternDetails,
+            ICraftingInventory inventory) {
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append("[增殖诊断] extract失败 pattern=").append(
+                    patternDetails == null ? "null" : patternDetails.getClass().getSimpleName());
+            sb.append(" 输入组=");
+            if (patternDetails != null) {
+                var inputs = patternDetails.getInputs();
+                if (inputs != null) {
+                    sb.append(inputs.length).append("组: ");
+                    for (int i = 0; i < inputs.length; i++) {
+                        var grp = inputs[i];
+                        if (grp == null) {
+                            continue;
+                        }
+                        sb.append("[").append(i).append("]mult=")
+                                .append(grp.getMultiplier()).append(" {");
+                        var poss = grp.getPossibleInputs();
+                        if (poss != null) {
+                            for (var gs : poss) {
+                                if (gs != null && gs.what() != null) {
+                                    sb.append(gs.what()).append("x")
+                                            .append(gs.amount()).append(" ");
+                                }
+                            }
+                        }
+                        sb.append("} ");
+                    }
+                } else {
+                    sb.append("null");
+                }
+            }
+            sb.append(" storage=");
+            if (inventory instanceof appeng.crafting.inv.ListCraftingInventory lci) {
+                sb.append(lci.list.size()).append("种: ");
+                for (var e : lci.list) {
+                    sb.append(e.getKey()).append("x").append(e.getLongValue()).append(" ");
+                }
+            } else {
+                sb.append(inventory == null ? "null" : inventory.getClass().getSimpleName());
+            }
+            AE2Addon.LOGGER.warn("[ae2addon] {}", sb);
+        } catch (Throwable t) {
+            AE2Addon.LOGGER.warn("[ae2addon] 增殖诊断失败: {}", t.toString());
+        }
     }
 
     // ── getCoProcessors 保护（与 OmniSequence 共存）──
@@ -779,6 +1344,12 @@ public abstract class CraftingCpuLogicMixin {
         var value = ae2addon$batchNext.get(pattern);
         if (value != null) {
             return value;
+        }
+        // 2026-09-09 上游同步：增殖配方（产物=输入同种）不继承共享经验——增殖批量 N
+        // 由本任务库存种子驱动（从 1 开始滚，逐轮翻倍），其他任务的大 N 起步会导致
+        // 首轮提取失败震荡。
+        if (ae2addon$isSelfReferentialPattern(pattern)) {
+            return 1L;
         }
         // 无本地经验：继承共享经验（其他 lane 同产物已成功翻倍到的 N）
         if (ae2addon$sharedExpCap() <= 0) {
@@ -827,6 +1398,9 @@ public abstract class CraftingCpuLogicMixin {
         if (Boolean.TRUE.equals(ae2addon$batchLocked.get(pattern))) {
             return;
         }
+        // 2026-09-09 上游同步提速：增殖配方（产物=输入同种）不再强制逐次——批量 N 成功后
+        // 正常翻倍（1→2→4…），配合种子回流翻倍实现指数滚雪球。共享经验对增殖也适用：
+        // 新 lane 继承 N 后种子不足会自然回退收敛（提取失败减半）。
         long maxMult = ae2addon$batchMaxMultiplier();
         long doubled = multiplier > maxMult / 2
                 ? maxMult

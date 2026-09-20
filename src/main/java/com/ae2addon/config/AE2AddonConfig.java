@@ -42,6 +42,15 @@ public final class AE2AddonConfig {
                     "Max batch multiplier for exponential push growth")
             .defineInRange("batchMaxMultiplier", Long.MAX_VALUE, 1L, Long.MAX_VALUE);
 
+    /** 全网格每 tick 成功 push 次数共享预算（0=不限制；防巨型订单独占服务端 tick）。 */
+    public static final ModConfigSpec.IntValue DISPATCH_BUDGET_PER_TICK = BUILDER
+            .comment("全网格每 tick 成功 push 次数共享预算（0=不限制=旧行为；",
+                    "与时间片纳秒预算正交，按成功 push 调用计数，批量大 N 一次推送不受影响；",
+                    "防多个巨型订单同 tick 抢占把服务端拖垮）",
+                    "Grid-wide successful-push budget per tick (0=unlimited; ",
+                    "orthogonal to time-slice ns budget; counts push calls not items)")
+            .defineInRange("dispatchBudgetPerTick", 20_000, 0, 10_000_000);
+
     /** 批量经验共享继承上限（新 lane 起步 N，防单次巨量 push）。 */
     public static final ModConfigSpec.LongValue SHARED_EXP_CAP = BUILDER
             .comment("批量经验共享继承上限（新 lane 从该 N 起步，0=不共享经验）",
@@ -82,6 +91,18 @@ public final class AE2AddonConfig {
             .comment("集成 CPU 显示的并行线程数（0 = 拉满 Integer.MAX_VALUE；真实执行由时间片限流接管）",
                     "Display thread count for integrated CPU (0 = max out)")
             .defineInRange("cpuDisplayThreads", 0, 0, 100_000_000);
+
+    /** 存储显示文本覆盖（非空时直接显示该文本，如「无限」「MAX」；空 = 数值/∞ 逻辑）。 */
+    public static final ModConfigSpec.ConfigValue<String> CPU_STORAGE_TEXT = BUILDER
+            .comment("集成 CPU 存储显示文本覆盖（非空时直接显示，如 无限/MAX/∞；留空=数值或∞）",
+                    "Storage display text override for integrated CPU (non-empty wins; empty = number/∞)")
+            .define("cpuStorageText", "");
+
+    /** 并行显示文本覆盖（非空时直接显示该文本，如「拉满」「MAX」；空 = 数值/∞ 逻辑）。 */
+    public static final ModConfigSpec.ConfigValue<String> CPU_THREADS_TEXT = BUILDER
+            .comment("集成 CPU 并行显示文本覆盖（非空时直接显示，如 拉满/MAX/∞；留空=数值或∞）",
+                    "Parallel display text override for integrated CPU (non-empty wins; empty = number/∞)")
+            .define("cpuThreadsText", "");
 
     // ── ME接口（无限级） ──
 
@@ -135,6 +156,33 @@ public final class AE2AddonConfig {
             .comment("ME接口(无限级)主动抽取每次气体量（默认1000）",
                     "Infinite Interface gas units per extract (default 1000)")
             .defineInRange("feederExtractGas", 1000, 1, Integer.MAX_VALUE);
+
+    /** 主动抽取循环累计上限（0=关闭循环；0=off, loop accumulate; 2026-09-03）。 */
+    public static final ModConfigSpec.IntValue FEEDER_EXTRACT_LOOP_CAP = BUILDER
+            .comment("Infinite Interface active-extract loop limit",
+                    "feederExtractLoopLimit")
+            .defineInRange("feederExtractLoopLimit", 1_000_000, 0, 2_000_000_000);
+
+    // ── ME接口（无限级）感应卡供电 ──
+
+    /** 感应卡单轮供电 FE 上限（1~int.MAX；默认 1 亿；插1张速度卡×16，插2张每轮灌满）。 */
+    public static final ModConfigSpec.LongValue FEEDER_POWER_FE_CAP = BUILDER
+            .comment("ME接口(无限级)感应卡单轮供电 FE 上限（1~2147483647；",
+                    "默认 100000000=1亿。Forge 能量槽是 int，单轮灌入上限即机器缺口",
+                    "（≤21.4亿），设再大也等效。速度卡：0张=此值，1张=此值×16(≤21.4亿)，",
+                    "2张=无上限(Long.MAX哨兵)每轮灌满缺口。多 tick 总吞吐由轮数×单轮叠加）",
+                    "Infinite Interface induction-card FE cap per pass (1~int.MAX;",
+                    "0 speed cards = this; 1 = ×16; 2 = unlimited Long.MAX sentinel)")
+            .defineInRange("feederPowerFeCap", 100_000_000L, 1L, Integer.MAX_VALUE);
+
+    /** 感应卡每 tick 供电轮数（每轮上限 FE_CAP；1=原行为，N=N×FE_CAP FE/t 上限）。 */
+    public static final ModConfigSpec.IntValue FEEDER_POWER_PASSES = BUILDER
+            .comment("ME接口(无限级)感应卡每tick供电轮数（每轮上限见 feederPowerFeCap，",
+                    "N轮=上限N×FE/t；默认1=单轮。机器收得慢时调大无效，",
+                    "瓶颈在机器接收速率时请先看机器侧）",
+                    "Infinite Interface induction-card power passes per tick",
+                    "(each pass capped at feederPowerFeCap; N passes = N× cap ceiling)")
+            .defineInRange("feederPowerPassesPerTick", 1, 1, 1024);
 
     // ── 调试 ──
 
@@ -202,6 +250,11 @@ public final class AE2AddonConfig {
         return Math.max(0L, SHARED_EXP_CAP.get());
     }
 
+    /** 全网格每 tick 成功 push 次数共享预算（0 = 不限制）。 */
+    public static int dispatchBudgetPerTick() {
+        return Math.max(0, DISPATCH_BUDGET_PER_TICK.get());
+    }
+
     public static long cheapOrderAmount() {
         return Math.max(1L, CHEAP_ORDER_AMOUNT.get());
     }
@@ -229,6 +282,16 @@ public final class AE2AddonConfig {
         return v <= 0 ? Integer.MAX_VALUE - 1 : v;
     }
 
+    /** 存储显示文本覆盖（去空格；空 = 未设置）。 */
+    public static String cpuStorageText() {
+        return CPU_STORAGE_TEXT.get() == null ? "" : CPU_STORAGE_TEXT.get().trim();
+    }
+
+    /** 并行显示文本覆盖（去空格；空 = 未设置）。 */
+    public static String cpuThreadsText() {
+        return CPU_THREADS_TEXT.get() == null ? "" : CPU_THREADS_TEXT.get().trim();
+    }
+
     /** ME接口(无限级)：每物品蓄水池目标保有量（0=关闭自动补货）。 */
     public static long feederStockTarget() {
         return Math.max(0L, FEEDER_STOCK_TARGET.get());
@@ -253,6 +316,11 @@ public final class AE2AddonConfig {
         return FEEDER_EXTRACT_STACK.get();
     }
 
+    /** 主动抽取循环累计上限（0 = 关闭循环）。 */
+    public static int feederExtractLoopCap() {
+        return Math.max(0, FEEDER_EXTRACT_LOOP_CAP.get());
+    }
+
     public static int feederExtractFluid() {
         return FEEDER_EXTRACT_FLUID.get();
     }
@@ -263,5 +331,32 @@ public final class AE2AddonConfig {
 
     public static int feederRestockInterval() {
         return Math.max(1, FEEDER_RESTOCK_INTERVAL.get());
+    }
+
+    /** 感应卡单轮供电 FE 上限（默认 1 亿；每 tick 总上限=此值×轮数）。 */
+    public static long feederPowerFeCap() {
+        return Math.max(1L, FEEDER_POWER_FE_CAP.get());
+    }
+
+    /**
+     * 感应卡有效供电上限（FE/轮）：按速度卡数量倍率。
+     * 0 张 = config 原值；1 张 = ×16（钳 int.MAX 防溢出）；≥2 张 = 无上限
+     * （Long.MAX_VALUE 哨兵：单轮灌满机器缺口，缺口本身 ≤ int.MAX 故安全）。
+     */
+    public static long feederPowerEffectiveFeCap(int speedCards) {
+        if (speedCards >= 2) {
+            return Long.MAX_VALUE; // 无上限哨兵（灌满缺口即止）
+        }
+        long cap = feederPowerFeCap();
+        if (speedCards == 1) {
+            // long 域乘法防溢出，再钳到 int.MAX（单轮超过缺口无意义）
+            return Math.min((long) Integer.MAX_VALUE, cap * 16L);
+        }
+        return cap;
+    }
+
+    /** 感应卡每 tick 供电轮数（每轮上限 feederPowerFeCap）。 */
+    public static int feederPowerPasses() {
+        return Math.max(1, FEEDER_POWER_PASSES.get());
     }
 }

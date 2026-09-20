@@ -154,6 +154,73 @@ public abstract class CraftingServiceMixin implements IntegratedCraftingServiceB
             return;
         }
 
+        // ── 2026-09-08 上游同步（v1.2.2 → upstream/main）：submitJob 增殖计划替换 ──
+        // 2026-09-09：增殖样板计划替换——AE2-VM 在模拟期（beginCraftingCalculation）
+        // 永远先接管（priority 2000 > 我们 1200，本类模拟期拦截实际轮不到，实锤：
+        // v31 启动后模拟拦截日志 0 次）且把「产物=输入」的增殖配方算成 missing 自身
+        // （CRAFT END missing={模板}）→ VM 生成的增殖计划残缺：网络只有 1 颗种子时
+        // UI 显示可用 1、提交后 CPU 卡进度 100%（sensei 10M 单实测）。
+        // VM 不注入 submitJob，这里是我们独占拦截点：finalOutput 命中模块白名单
+        // 自指增殖样板时，用 buildModuleSettlePlan 的正确计划（种子1+材料链展开+
+        // 增殖样板 safeTimes 次）替换 VM 的坏计划再走原版提交。
+        if (!job.simulation() && job.finalOutput() != null
+                && job.finalOutput().what() != null) {
+            try {
+                AEKey finalKey = job.finalOutput().what();
+                var module = com.ae2addon.block.AssemblerRegistry.moduleForGrid(this.grid);
+                if (module != null) {
+                    // 是否模块白名单自指增殖样板（只替换增殖：普通合成 VM 算得对）
+                    var patterns = grid.getCraftingService().getCraftingFor(finalKey);
+                    boolean isModuleSelfRef = false;
+                    if (patterns != null) {
+                        for (var p : patterns) {
+                            if (ae2addon$isCraftingPattern(p) && module.declares(p)
+                                    && ae2addon$isSelfReferentialPatternLocal(p)) {
+                                isModuleSelfRef = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (isModuleSelfRef) {
+                        long amount = job.finalOutput().amount();
+                        ICraftingPlan replacement = ae2addon$buildModuleSettlePlan(
+                                this.grid, module, finalKey, amount);
+                        if (replacement != null) {
+                            com.ae2addon.AE2Addon.LOGGER.warn(
+                                    "[ae2addon] submitJob替换增殖计划: what={} amount={}（VM计划缺失自身种子，改用模块即时结算计划）",
+                                    finalKey, amount);
+                            // 直接提交替换计划（@Inject 无法改原方法参数）。
+                            // target 为集成 CPU 簇时直接提交；target==null（终端
+                            // 自动选 CPU）时从注册表挑本网格空闲 lane 提交。
+                            CraftingCPUCluster submitTo = null;
+                            if (target instanceof CraftingCPUCluster selectedCpu) {
+                                submitTo = selectedCpu;
+                            } else {
+                                submitTo = ae2addon$findIdleIntegratedCpu();
+                            }
+                            if (submitTo != null) {
+                                ICraftingSubmitResult replaced = submitTo.submitJob(
+                                        grid, replacement, source, requestingMachine);
+                                callback.setReturnValue(replaced);
+                                // 2026-09-08 本地适配修正：setReturnValue 内部已调用
+                                // CallbackInfo.cancel()（mixin 0.8.7 字节码实证：首条指令即
+                                // invokespecial CallbackInfo.cancel），上游紧跟的
+                                // callback.cancel() 会抛 CancellationException，被下方
+                                // catch 吞掉后继续走原提交路径（替换失效），故本地不调用。
+                                return;
+                            }
+                            com.ae2addon.AE2Addon.LOGGER.warn(
+                                    "[ae2addon] submitJob增殖替换：无可用集成CPU({})，放行原提交",
+                                    target == null ? "null" : target.getClass().getSimpleName());
+                        }
+                    }
+                }
+            } catch (RuntimeException replaceError) {
+                com.ae2addon.AE2Addon.LOGGER.warn(
+                        "[ae2addon] submitJob增殖替换异常，按原计划继续: {}", replaceError.toString());
+            }
+        }
+
         // 巨型订单识别：从上下文缓存取（模拟拦截创建的真 CraftingPlan 实例）
         Object[] ctx = ae2addon$deferredContexts.remove(job);
         if (ctx != null) {
@@ -286,6 +353,17 @@ public abstract class CraftingServiceMixin implements IntegratedCraftingServiceB
             }
             return;
         }
+        // ── 2026-09-08 上游同步：模块模拟期即时结算 ──
+        // 装配模块即时结算（2026-09-06，2026-09-09 改为不看金额）：合成族 + 模块
+        // 白名单请求直接在模拟期返回成功计划——AE2-VM 把模板复制(a+b=2a)等
+        // 「产物=输入」增殖配方当递归判缺料/死循环（missing 自己），任务死在模拟期。
+        // 无论金额大小都必须绕开 VM：小额(≤cheapOrderAmount)本是免估算路径，
+        // 大额(>cheapOrderAmount)如 10M 增殖单会被 RC.analyze 判定不超限后放行
+        // 原版/VM 模拟 → 卡死在「正在计算」（sensei 实测 21:30）。因此先无条件
+        // 尝试即时结算，仅当目标不是模块白名单样板（结算失败）才回落金额分流。
+        if (ae2addon$tryModuleSettlePlan(what, amount, callback)) {
+            return;
+        }
         // 小额订单免估算：直接走原版（不展开配方树，避免服务端线程卡顿）
         if (amount <= ae2addon$cheapOrderAmount()) {
             return;
@@ -365,6 +443,333 @@ public abstract class CraftingServiceMixin implements IntegratedCraftingServiceB
                     "[ae2addon] 模拟拦截：需求超限，改为真 CraftingPlan what={} amount={} perBatch={} truncated={}",
                     what, amount, perBatch, analysis.truncated);
         }
+    }
+
+    // ── 2026-09-08 上游同步（upstream/main）：装配模块即时结算 / 增殖材料递归展开 ──
+
+    /**
+     * 装配模块模拟期即时结算（2026-09-06）：目标产物被本网格装配模块白名单声明且属
+     * 合成族时，直接返回成功计划（绕开 AE2-VM——VM 把模板复制 a+b=2a 这类
+     * 「产物=输入」增殖配方当递归判缺料，任务死在模拟期，push 前结算轮不到）。
+     * 计划按真实配方展开（used=单次输入×执行次数、patternTimes 全量），提交后由
+     * 集成 CPU 的 push 前虚拟结算正常执行；预览/模拟调用不扣料不产料，无副作用。
+     *
+     * @return true = 已接管（caller 需 return）
+     */
+    @Unique
+    private boolean ae2addon$tryModuleSettlePlan(AEKey what, long amount,
+            CallbackInfoReturnable<Future<ICraftingPlan>> callback) {
+        try {
+            if (grid == null || what == null || amount <= 0) {
+                return false;
+            }
+            var module = com.ae2addon.block.AssemblerRegistry.moduleForGrid(grid);
+            if (module == null) {
+                return false;
+            }
+            ICraftingPlan plan = ae2addon$buildModuleSettlePlan(grid, module, what, amount);
+            if (plan == null) {
+                return false;
+            }
+            // 2026-09-08 本地适配修正：上游此处为 callback.cancel() + setReturnValue()，
+            // 但 setReturnValue 内部即调用 CallbackInfo.cancel()（mixin 0.8.7 字节码实证），
+            // 重复 cancel 会抛 CancellationException 被下方 catch 吞掉 → 模拟期返回 null
+            // Future。故本地只调用 setReturnValue。
+            callback.setReturnValue(CompletableFuture.completedFuture(plan));
+            return true;
+        } catch (RuntimeException e) {
+            com.ae2addon.AE2Addon.LOGGER.warn(
+                    "[ae2addon] 模块即时结算异常，放行原路径: {}", e.toString());
+            return false;
+        }
+    }
+
+    /**
+     * 构造装配模块即时结算计划（2026-09-09 从 tryModuleSettlePlan 拆出）：
+     * 目标为模块白名单合成族样板时，绕过 AE2-VM 模拟（VM 把「产物=输入」的
+     * 增殖配方当递归判缺料/死循环）直接构造正确计划。供两处使用：
+     * ① 模拟期 beginCraftingCalculation（VM 先接管时实际轮不到，2026-09-09 实锤）；
+     * ② submitJob 提交期（VM 不注入 submitJob，这里是我们独占拦截点——
+     *    sensei 10M 增殖单卡死方案：检测到 VM 生成的增殖坏计划时在此替换）。
+     * 含自指种子 1 份起手 + 非自指材料递归展开（expandMaterial，库存不足自动
+     * 走材料配方链）+ 增殖主样板 safeTimes 次。
+     */
+    @Unique
+    private appeng.api.networking.crafting.ICraftingPlan ae2addon$buildModuleSettlePlan(
+            appeng.api.networking.IGrid grid,
+            com.ae2addon.block.AssemblerCoreBE module,
+            AEKey what, long amount) {
+        if (grid == null || module == null || what == null || amount <= 0) {
+            return null;
+        }
+        // 找 what 的合成族样板且被模块声明
+        java.util.Collection<appeng.api.crafting.IPatternDetails> patterns =
+                grid.getCraftingService().getCraftingFor(what);
+        if (patterns == null || patterns.isEmpty()) {
+            return null;
+        }
+        appeng.api.crafting.IPatternDetails chosen = null;
+        for (var p : patterns) {
+            if (ae2addon$isCraftingPattern(p) && module.declares(p)) {
+                chosen = p;
+                break;
+            }
+        }
+        if (chosen == null) {
+            return null;
+        }
+        var outs = chosen.getOutputs();
+        // 2026-09-08 AE2 19 适配：IPatternDetails.getOutputs() 在 AE2 19 返回
+        // List<GenericStack>（javap ae2-19.2.17 实证），上游的 length / [0] 改为
+        // size() / get(0)。
+        long outPer = outs != null && !outs.isEmpty() && outs.get(0) != null
+                ? Math.max(1, outs.get(0).amount()) : 1;
+        long times = Math.max(1, (amount + outPer - 1) / outPer);
+        var used = new KeyCounter();
+        // 2026-09-09：去掉 Integer.MAX 截断——TaskProgress.value 是 long（反编译
+        // 字节码实证 getfield value:J），100 亿级增殖单（times=5e9）此前被砍到
+        // 21.4 亿次 → 任务值归零但产物不足 → 首次卡 100% 不完成（sensei 实测：
+        // 100 亿单要下两次才出 200 亿）。long 域完整执行；ScaledPattern 批量
+        // N× 乘法溢出由 multiplyExact 异常自动回退 1×（已有保护）。
+        long safeTimes = times;
+        // 自指种子集合（产物=输入的增殖配方，如模板复制）：种子 used 只放 1
+        // 份起手——全量备 N 个自身种子备不齐；CPU 逐次结算靠产物倍增滚雪球。
+        java.util.Set<AEKey> selfKeys = new java.util.HashSet<>();
+        if (outs != null) {
+            for (var o : outs) {
+                if (o != null && o.what() != null) {
+                    selfKeys.add(o.what());
+                }
+            }
+        }
+        java.util.Map<appeng.api.crafting.IPatternDetails, Long> patternTimes =
+                new java.util.HashMap<>();
+        patternTimes.put(chosen, safeTimes);
+        // 2026-09-09 递归材料展开：非自指输入若网络库存不足，展开其合成配方链
+        // （材料自己的配方样板，可能多级），只有真叶子才进 used。
+        java.util.Set<AEKey> materialGuard = new java.util.HashSet<>(selfKeys);
+        for (var inputGroup : chosen.getInputs()) {
+            if (inputGroup == null || inputGroup.getPossibleInputs() == null
+                    || inputGroup.getPossibleInputs().length == 0) {
+                continue;
+            }
+            var gs = inputGroup.getPossibleInputs()[0];
+            if (gs == null || gs.what() == null) {
+                continue;
+            }
+            if (selfKeys.contains(gs.what())) {
+                used.add(gs.what(), 1); // 自指种子：1 份起手
+                continue;
+            }
+            long mult = Math.max(1, inputGroup.getMultiplier());
+            long needPer = gs.amount() * mult;
+            if (needPer <= 0) {
+                continue;
+            }
+            // 库存抵扣：网络可提取的先用库存，缺口才展开配方链
+            long needTotal;
+            try {
+                needTotal = Math.multiplyExact(needPer, safeTimes);
+            } catch (ArithmeticException overflow) {
+                // 超出 long 记账上限：放行原路径（模拟拦截/拆批会处理）
+                used.add(gs.what(), Long.MAX_VALUE / 2);
+                continue;
+            }
+            if (needTotal <= 0) {
+                continue;
+            }
+            ae2addon$expandMaterial(grid, module, gs.what(), needTotal,
+                    used, patternTimes, materialGuard, 0);
+        }
+        var plan = new appeng.crafting.CraftingPlan(
+                new appeng.api.stacks.GenericStack(what, amount),
+                Long.MAX_VALUE,
+                false,            // simulation
+                false,            // multiplePaths
+                used,
+                new KeyCounter(), // emittedItems
+                new KeyCounter(), // missingItems（自指种子由 used 提取，网络有即可）
+                patternTimes);
+        com.ae2addon.AE2Addon.LOGGER.warn(
+                "[ae2addon] 模块即时结算: what={} amount={} 配方={} times={} 输入={}种（绕开 VM 模拟）",
+                what, amount, chosen.getClass().getSimpleName(), safeTimes, used.size());
+        return plan;
+    }
+
+    // ── 增殖材料递归展开（2026-09-09）──
+
+    /**
+     * 递归展开材料的配方链：非自指输入若网络库存不足，则把缺口转交该材料的
+     * 合成配方（子任务），直到叶子（无配方/库存充足）。支持多级：增殖要钻石、
+     * 钻石没货但钻石有配方（材料链 A→B→C…层层合成）。
+     *
+     * @param used 需要从网络库存提取的叶子材料（真库存/无配方才进 used）
+     * @param patternTimes 合成配方执行次数（增殖样板 + 材料子配方共享）
+     * @param guard 防环：已展开过的材料 key 集合（自身种子已处理）
+     * @param depth 递归深度上限（防配方环 A→B→A 死循环）
+     */
+    @Unique
+    private void ae2addon$expandMaterial(appeng.api.networking.IGrid grid,
+            com.ae2addon.block.AssemblerCoreBE module, AEKey material, long need,
+            KeyCounter used,
+            java.util.Map<appeng.api.crafting.IPatternDetails, Long> patternTimes,
+            java.util.Set<AEKey> guard, int depth) {
+        try {
+            if (need <= 0 || material == null) {
+                return;
+            }
+            if (depth > 12) {
+                // 展开深度超限（疑似配方环）：剩余缺口退回叶子，由库存/缺料自然处理
+                used.add(material, need);
+                return;
+            }
+            if (!guard.add(material)) {
+                // 已在展开链上：配方环（A→B→A）。缺口无法自举，当叶子处理。
+                used.add(material, need);
+                return;
+            }
+            try {
+                // 1) 库存抵扣：网络能直接提取的先用库存（含无限元件哨兵）
+                long inStock = 0;
+                try {
+                    var storage = grid.getStorageService().getInventory();
+                    // SIMULATE 探活可提取量（不真实扣库）；返回 min(need, 实际可得)
+                    inStock = storage.extract(material, need,
+                            appeng.api.config.Actionable.SIMULATE,
+                            appeng.api.networking.security.IActionSource.empty());
+                } catch (RuntimeException inventoryError) {
+                    inStock = 0;
+                }
+                if (inStock >= need) {
+                    used.add(material, need); // 库存够：整需求进 used（CPU 从网络提取）
+                    return;
+                }
+                if (inStock > 0) {
+                    used.add(material, inStock);
+                    need -= inStock;
+                }
+                // 2) 剩余缺口：找材料的合成配方（合成族 + 模块白名单）
+                java.util.Collection<appeng.api.crafting.IPatternDetails> recipes =
+                        grid.getCraftingService().getCraftingFor(material);
+                if (recipes == null || recipes.isEmpty()) {
+                    used.add(material, need); // 无配方叶子：缺口回 used（库存不够自然缺料）
+                    return;
+                }
+                appeng.api.crafting.IPatternDetails sub = null;
+                for (var p : recipes) {
+                    if (ae2addon$isCraftingPattern(p) && module.declares(p)
+                            && !ae2addon$isSelfReferentialPatternLocal(p)) {
+                        sub = p;
+                        break;
+                    }
+                }
+                if (sub == null) {
+                    // 无可用配方：叶子（虚拟结算只认模块白名单合成族；真实机器配方
+                    // 不在白名单的走原版模拟路径，这里不展开避免误判）
+                    used.add(material, need);
+                    return;
+                }
+                // 3) 子配方执行次数 = ceil(need / 单次产出 material 量)
+                long subOut = 0;
+                for (var o : sub.getOutputs()) {
+                    if (o != null && o.what() != null && o.what().equals(material)) {
+                        subOut = Math.max(subOut, o.amount());
+                    }
+                }
+                if (subOut <= 0) {
+                    used.add(material, need);
+                    return;
+                }
+                long subTimes = Math.max(1, (need + subOut - 1) / subOut);
+                patternTimes.merge(sub, subTimes, Long::sum);
+                // 4) 递归子配方的输入
+                for (var inputGroup : sub.getInputs()) {
+                    if (inputGroup == null || inputGroup.getPossibleInputs() == null
+                            || inputGroup.getPossibleInputs().length == 0) {
+                        continue;
+                    }
+                    var subGs = inputGroup.getPossibleInputs()[0];
+                    if (subGs == null || subGs.what() == null) {
+                        continue;
+                    }
+                    // 子配方输入若与子配方产物同种（子增殖/环），跳过（种子交给上层自指逻辑）
+                    boolean subSelf = false;
+                    for (var so : sub.getOutputs()) {
+                        if (so != null && so.what() != null
+                                && so.what().equals(subGs.what())) {
+                            subSelf = true;
+                            break;
+                        }
+                    }
+                    if (subSelf) {
+                        used.add(subGs.what(), 1); // 子增殖种子：1 份起手
+                        continue;
+                    }
+                    long subMult = Math.max(1, inputGroup.getMultiplier());
+                    long subNeed;
+                    try {
+                        subNeed = Math.multiplyExact(
+                                Math.multiplyExact(subGs.amount(), subMult), subTimes);
+                    } catch (ArithmeticException overflow) {
+                        used.add(subGs.what(), Long.MAX_VALUE / 2);
+                        continue;
+                    }
+                    if (subNeed > 0) {
+                        ae2addon$expandMaterial(grid, module, subGs.what(), subNeed,
+                                used, patternTimes, guard, depth + 1);
+                    }
+                }
+            } finally {
+                guard.remove(material);
+            }
+        } catch (RuntimeException e) {
+            com.ae2addon.AE2Addon.LOGGER.warn(
+                    "[ae2addon] 材料递归展开异常（material={}）: {}", material, e.toString());
+        }
+    }
+
+    /** 自指配方本地判定（产物=输入同种；与 CraftingCpuLogicMixin 同语义，mixin 间不互引用）。 */
+    @Unique
+    private static boolean ae2addon$isSelfReferentialPatternLocal(
+            appeng.api.crafting.IPatternDetails pattern) {
+        if (pattern == null) {
+            return false;
+        }
+        var outs = pattern.getOutputs();
+        if (outs == null || outs.isEmpty()) { // AE2 19 适配：List 而非数组
+            return false;
+        }
+        for (var inGroup : pattern.getInputs()) {
+            if (inGroup == null || inGroup.getPossibleInputs() == null) {
+                continue;
+            }
+            for (var gs : inGroup.getPossibleInputs()) {
+                if (gs == null || gs.what() == null) {
+                    continue;
+                }
+                for (var out : outs) {
+                    if (out != null && out.what() != null
+                            && out.what().equals(gs.what())) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** 合成族判定（与 CraftingCpuLogicMixin 同逻辑，mixin 间不互相引用）。 */
+    @Unique
+    private static boolean ae2addon$isCraftingPattern(appeng.api.crafting.IPatternDetails pattern) {
+        if (pattern == null) {
+            return false;
+        }
+        String name = pattern.getClass().getName();
+        return !name.endsWith("AEProcessingPattern")
+                && (name.endsWith("AECraftingPattern")
+                        || name.endsWith("AEStonecuttingPattern")
+                        || name.endsWith("AESmithingTablePattern")
+                        || name.contains("CraftingPattern"));
     }
 
     /** 受理拆批订单：入队异步执行，返回成功（无 link，调用方按受理处理）。 */
@@ -467,6 +872,45 @@ public abstract class CraftingServiceMixin implements IntegratedCraftingServiceB
             return true;
         }
         return false;
+    }
+
+    /**
+     * 找一个同网格的空闲集成 CPU lane（增殖计划替换提交用，2026-09-09）：
+     * 终端自动选 CPU 提交时 target=null，此处理选空闲 lane。
+     * 先 ensureOneIdleCpu 确保有空闲 lane，再取之；找不到返回 null。
+     */
+    @Unique
+    private CraftingCPUCluster ae2addon$findIdleIntegratedCpu() {
+        try {
+            for (var blockEntity : IntegratedCPURegistry.all()) {
+                if (blockEntity.isRemoved() || !blockEntity.isFormed()) {
+                    continue;
+                }
+                // 只认本网格（跨网络误提交=任务永远不动）
+                appeng.api.networking.IGrid beGrid = null;
+                try {
+                    var node = blockEntity.getMainNode() == null
+                            ? null : blockEntity.getMainNode().getNode();
+                    if (node != null) {
+                        beGrid = node.getGrid();
+                    }
+                } catch (RuntimeException ignored) {
+                    // 网格未就绪：跳过
+                }
+                if (beGrid != this.grid) {
+                    continue;
+                }
+                blockEntity.ensureOneIdleCpu();
+                var cpu = blockEntity.getOrCreateIdleCpu();
+                if (cpu != null && !cpu.isDestroyed() && cpu.isActive() && !cpu.isBusy()) {
+                    return cpu;
+                }
+            }
+        } catch (RuntimeException e) {
+            com.ae2addon.AE2Addon.LOGGER.warn(
+                    "[ae2addon] 查找空闲集成CPU异常: {}", e.toString());
+        }
+        return null;
     }
 
     @Unique

@@ -17,27 +17,69 @@ public final class CraftingCompat {
      * 热路径调试日志开关（config debugLogs 初始值，可在游戏内命令切换；
      * 配置热加载会同步覆盖）：高频日志全量打开会拖慢服务端，排查时才开启。
      */
-    public static volatile boolean debugLogs = com.ae2addon.config.AE2AddonConfig.debugLogs();
+    /**
+     * ⚠️ 本类的静态字段**不得**在静态初始化器里读 AE2AddonConfig（2026-09-20 崩溃修复）：
+     * mixin 插件 AE2AddonMixinPlugin.shouldApplyMixin 在「配置尚未加载」的启动极早期就会触碰
+     * 本类（timeSliceActive），任何 <clinit> 里的 ModConfigSpec.get() 都会抛
+     * IllegalStateException: Cannot get config value before config is loaded → ExceptionInInitializerError → 启动中止。
+     * 这里只放 spec 默认值字面量，真实值由 AE2AddonConfig.apply()（配置 Loading/Reloading 事件）调 applyConfig() 同步。
+     */
+    public static volatile boolean debugLogs = false;
 
     // ── 可热加载配置（config/ae2addon-common.toml 修改后自动生效，无需重启）──
 
-    /** 批量推送翻倍上限（1×→2×→4× 指数暴涨的最大 N）。 */
-    public static volatile long batchMaxMultiplier =
-            com.ae2addon.config.AE2AddonConfig.batchMaxMultiplier();
+    /** 批量推送翻倍上限（1×→2×→4× 指数暴涨的最大 N）。字面量 = spec 默认值。 */
+    public static volatile long batchMaxMultiplier = Long.MAX_VALUE;
 
-    /** 批量经验共享继承上限（0 = 关闭共享，新 lane 从 1× 起步）。 */
-    public static volatile long sharedExpCap =
-            com.ae2addon.config.AE2AddonConfig.sharedExpCap();
+    /** 批量经验共享继承上限（0 = 关闭共享，新 lane 从 1× 起步）。字面量 = spec 默认值。 */
+    public static volatile long sharedExpCap = 65536L;
 
-    /** 小额订单免估算阈值（下单量 ≤ 此值不展开配方树，防普通订单卡顿）。 */
-    public static volatile long cheapOrderAmount =
-            com.ae2addon.config.AE2AddonConfig.cheapOrderAmount();
+    /** 全网格每 tick 成功 push 共享预算（0 = 不限制；2026-09-08 学 ae2lt 双预算思想）。字面量 = spec 默认值。 */
+    public static volatile int dispatchBudgetPerTick = 20_000;
+
+    /** 预算记账：当前 tick 与已用成功 push 数（惰性 tick 切换重置；服务端单线程安全）。 */
+    private static long dispatchBudgetTick = Long.MIN_VALUE;
+    private static int dispatchUsed;
+
+    /** push 成功时调用；返回 false = 本 tick 共享预算已耗尽（拒绝本次 push）。 */
+    public static boolean tryConsumeDispatch() {
+        int budget = dispatchBudgetPerTick;
+        if (budget <= 0) {
+            return true; // 不限制（旧行为）
+        }
+        long tick = appeng.hooks.ticking.TickHandler.instance().getCurrentTick();
+        if (tick != dispatchBudgetTick) {
+            dispatchBudgetTick = tick;
+            dispatchUsed = 0;
+        }
+        if (dispatchUsed >= budget) {
+            return false;
+        }
+        dispatchUsed++;
+        return true;
+    }
+
+    /** push 失败/未实际发生：退回本 tick 已用配额（预算按成功调用计费）。 */
+    public static void refundDispatch() {
+        if (dispatchUsed > 0) {
+            dispatchUsed--;
+        }
+    }
+
+    /** 诊断：本 tick 已用预算（0=未启用）。 */
+    public static int dispatchUsedThisTick() {
+        return dispatchBudgetPerTick <= 0 ? 0 : dispatchUsed;
+    }
+
+    /** 小额订单免估算阈值（下单量 ≤ 此值不展开配方树，防普通订单卡顿）。字面量 = spec 默认值。 */
+    public static volatile long cheapOrderAmount = 1_000_000L;
 
     /** 配置热加载时由 AE2AddonConfig 调用，同步最新值。 */
     public static void applyConfig() {
         debugLogs = com.ae2addon.config.AE2AddonConfig.debugLogs();
         batchMaxMultiplier = com.ae2addon.config.AE2AddonConfig.batchMaxMultiplier();
         sharedExpCap = com.ae2addon.config.AE2AddonConfig.sharedExpCap();
+        dispatchBudgetPerTick = com.ae2addon.config.AE2AddonConfig.dispatchBudgetPerTick();
         cheapOrderAmount = com.ae2addon.config.AE2AddonConfig.cheapOrderAmount();
     }
 

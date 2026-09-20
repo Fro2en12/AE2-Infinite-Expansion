@@ -53,11 +53,35 @@ public class AE2Addon {
         // 方块能力注册（NeoForge 1.21.1：能力经 RegisterCapabilitiesEvent 提供）
         modEventBus.addListener(AE2Addon::onRegisterCapabilities);
 
+        // 线缆面板 part 的能力注册（AE2 19 官方扩展点；2026-09-20 补：
+        // AE2 内部把 part 能力转成 registerBlockEntity，provider 的 side = part 所在面、按 part 类精确匹配）
+        modEventBus.addListener(AE2Addon::onRegisterPartCapabilities);
+
         // 巨型订单队列 tick（ServerTickEvent.Post）
         net.neoforged.neoforge.common.NeoForge.EVENT_BUS.register(com.ae2addon.crafting.BatchedCraftingQueue.class);
 
         // 注册网络数据包（NeoForge 1.21 payload 网络）
         modEventBus.addListener(AE2Addon::registerPayloads);
+
+        // 集成 CPU 菜单 opener（2026-09-20 补：AE2 19 的 MenuOpener.open 需要先 addOpener 注册 opener，
+        // 否则右键集成 CPU 只会打一条 "unknown menu type" warn 并静默无反应）
+        modEventBus.addListener((net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent event) ->
+                event.enqueueWork(() -> appeng.menu.MenuOpener.addOpener(
+                        ModMenuTypes.INTEGRATED_CPU.get(),
+                        com.ae2addon.gui.IntegratedCPUMenu::openMenu)));
+
+        // 线缆面板 part 模型注册（2026-09-02 上游同步）：必须早于 AE2 的
+        // PartModels.freeze()；此处为客户端最早时机（服务端不加载模型）。
+        if (net.neoforged.fml.loading.FMLEnvironment.dist.isClient()) {
+            try {
+                var partModels = appeng.items.parts.PartModelsHelper
+                        .createModels(com.ae2addon.part.InfiniteInterfacePart.class);
+                appeng.api.parts.PartModels.registerModels(partModels);
+                LOGGER.info("[ae2addon] part 模型已注册: {}", partModels.size());
+            } catch (Throwable t) {
+                LOGGER.warn("[ae2addon] part 模型注册失败(构造期): ", t);
+            }
+        }
 
         LOGGER.info("✅ AE2 Addon loaded! Universal Storage Cells ready!");
     }
@@ -76,6 +100,14 @@ public class AE2Addon {
         registrar.playToClient(FeederStatusPacket.TYPE, FeederStatusPacket.STREAM_CODEC, FeederStatusPacket::handle);
         registrar.playToClient(LaneListPacket.TYPE, LaneListPacket.STREAM_CODEC, LaneListPacket::handle);
         registrar.playToClient(OrderListPacket.TYPE, OrderListPacket.STREAM_CODEC, OrderListPacket::handle);
+        // 「退回网络」按钮（上游 v1.3.0+ 同步）
+        registrar.playToServer(com.ae2addon.network.FeederReturnPacket.TYPE,
+                com.ae2addon.network.FeederReturnPacket.STREAM_CODEC,
+                com.ae2addon.network.FeederReturnPacket::handle);
+        // 装配处理器样板翻页（v0.3 M3，上游 v1.3.0 同步）
+        registrar.playToServer(com.ae2addon.network.AssemblerPagePacket.TYPE,
+                com.ae2addon.network.AssemblerPagePacket.STREAM_CODEC,
+                com.ae2addon.network.AssemblerPagePacket::handle);
     }
 
     public static ResourceLocation id(String path) {
@@ -106,12 +138,42 @@ public class AE2Addon {
         event.registerBlockEntity(net.neoforged.neoforge.capabilities.Capabilities.FluidHandler.BLOCK,
                 ModBlockEntities.INFINITE_INTERFACE.get(),
                 (be, side) -> ((com.ae2addon.block.InfiniteInterfaceBE) be).getNetworkFluidHandler());
+        // AE2 存储能力（存储总线/子网可直连主网存储；上游 v1.3.0 同步：
+        // 上游在 getCapability 里对 Capabilities.STORAGE 返回主网 MEStorage，不区分面、无网返空）
+        event.registerBlockEntity(appeng.api.AECapabilities.ME_STORAGE,
+                ModBlockEntities.INFINITE_INTERFACE.get(),
+                (be, side) -> {
+                    var grid = ((com.ae2addon.block.InfiniteInterfaceBE) be).getMainNode().getGrid();
+                    return grid == null ? null : grid.getStorageService().getInventory();
+                });
         // 化学能力（可选集成：Mekanism 存在才注册）
         if (com.ae2addon.compat.MekanismGasCompat.isLoaded()) {
             event.registerBlockEntity(mekanism.common.capabilities.Capabilities.CHEMICAL.block(),
                     ModBlockEntities.INFINITE_INTERFACE.get(),
                     (be, side) -> (mekanism.api.chemical.IChemicalHandler) ((com.ae2addon.block.InfiniteInterfaceBE) be)
                             .getChemHandler(side, mekanism.common.capabilities.Capabilities.CHEMICAL.block()));
+        }
+    }
+
+    /**
+     * 线缆面板 part 的能力（2026-09-20 补，AE2 19 官方扩展点）：
+     * 方块版的物品/流体/化学入口在 part 形态下同样对外可见（管道/漏斗可直接塞进网络）。
+     */
+    private static void onRegisterPartCapabilities(
+            appeng.api.parts.RegisterPartCapabilitiesEvent event) {
+        event.register(net.neoforged.neoforge.capabilities.Capabilities.ItemHandler.BLOCK,
+                (com.ae2addon.part.InfiniteInterfacePart part, net.minecraft.core.Direction side) ->
+                        part.getNetworkItemHandler(),
+                com.ae2addon.part.InfiniteInterfacePart.class);
+        event.register(net.neoforged.neoforge.capabilities.Capabilities.FluidHandler.BLOCK,
+                (com.ae2addon.part.InfiniteInterfacePart part, net.minecraft.core.Direction side) ->
+                        part.getNetworkFluidHandler(),
+                com.ae2addon.part.InfiniteInterfacePart.class);
+        if (com.ae2addon.compat.MekanismGasCompat.isLoaded()) {
+            event.register(mekanism.common.capabilities.Capabilities.CHEMICAL.block(),
+                    (com.ae2addon.part.InfiniteInterfacePart part, net.minecraft.core.Direction side) ->
+                            (mekanism.api.chemical.IChemicalHandler) part.getChemHandler(),
+                    com.ae2addon.part.InfiniteInterfacePart.class);
         }
     }
 
@@ -126,33 +188,51 @@ public class AE2Addon {
         }
         try {
             var block = ModBlocks.INFINITE_INTERFACE.get();
-            // AE2 自带卡片（容量/红石/反向/合成）
+            // 升级卡注册到宿主（2026-09-02 part 版：面板物品同样注册，方到 Part 阶段补）
+            // ⚠️ Upgrades.add(upgrade, supportedBy, max)：卡片在前，机器在后！
+            registerInterfaceUpgrades(block);
+            var partItem = ModItems.INFINITE_INTERFACE_PANEL_ITEM.get();
+            registerInterfaceUpgrades(partItem);
+            // 速度卡：感应卡供电倍率（1张×16，2张每轮无上限）+ 喂出预算 ×2/张
             appeng.api.upgrades.Upgrades.add(
-                    appeng.core.definitions.AEItems.CAPACITY_CARD.asItem(), block, 4);
+                    appeng.core.definitions.AEItems.SPEED_CARD.asItem(), block, 2);
             appeng.api.upgrades.Upgrades.add(
-                    appeng.core.definitions.AEItems.REDSTONE_CARD.asItem(), block, 1);
+                    appeng.core.definitions.AEItems.SPEED_CARD.asItem(), partItem, 2);
+            COMPAT_UPGRADES.set(true); // 全部成功才置位
+            LOGGER.info("[ae2addon] 升级卡注册完成（{} 张卡类型）",
+                    appeng.api.upgrades.Upgrades.getMaxInstallable(
+                            appeng.core.definitions.AEItems.CAPACITY_CARD.asItem(), block.asItem()));
+        } catch (Throwable t) {
+            // 失败不置位：下次 BE 构造重试，并打堆栈定位
+            LOGGER.warn("[ae2addon] 升级卡注册失败（将重试）", t);
+        }
+    }
+
+    /** 给某机器 item 注册 AE2 自带卡 + 跨 mod 卡（容量/红石/反向/合成/感应/频道/虚拟）。 */
+    private static void registerInterfaceUpgrades(net.minecraft.world.level.ItemLike machine) {
+        try {
             appeng.api.upgrades.Upgrades.add(
-                    appeng.core.definitions.AEItems.INVERTER_CARD.asItem(), block, 1);
+                    appeng.core.definitions.AEItems.CAPACITY_CARD.asItem(), machine, 4);
             appeng.api.upgrades.Upgrades.add(
-                    appeng.core.definitions.AEItems.CRAFTING_CARD.asItem(), block, 1);
-            // AppFlux 感应卡（供电卡）
+                    appeng.core.definitions.AEItems.REDSTONE_CARD.asItem(), machine, 1);
+            appeng.api.upgrades.Upgrades.add(
+                    appeng.core.definitions.AEItems.INVERTER_CARD.asItem(), machine, 1);
+            appeng.api.upgrades.Upgrades.add(
+                    appeng.core.definitions.AEItems.CRAFTING_CARD.asItem(), machine, 1);
             var inductionCard = com.ae2addon.compat.AppFluxPowerCompat.inductionCard();
             if (inductionCard != null) {
-                appeng.api.upgrades.Upgrades.add(inductionCard, block, 1);
+                appeng.api.upgrades.Upgrades.add(inductionCard, machine, 1);
             }
-            // ExtendedAE+ 频道卡 + 虚拟合成卡
             var channelCard = com.ae2addon.compat.ExtendedAEPlusCompat.channelCard();
             if (channelCard != null) {
-                appeng.api.upgrades.Upgrades.add(channelCard, block, 1);
+                appeng.api.upgrades.Upgrades.add(channelCard, machine, 1);
             }
             var virtualCard = com.ae2addon.compat.ExtendedAEPlusCompat.virtualCraftingCard();
             if (virtualCard != null) {
-                appeng.api.upgrades.Upgrades.add(virtualCard, block, 1);
+                appeng.api.upgrades.Upgrades.add(virtualCard, machine, 1);
             }
-            COMPAT_UPGRADES.set(true); // 全部成功才置位
-            LOGGER.info("[ae2addon] 升级卡注册完成");
-        } catch (Throwable t) {
-            LOGGER.warn("[ae2addon] 升级卡注册失败（将重试）", t);
+        } catch (Throwable ignored) {
+            // 单宿主失败不阻塞另一个
         }
     }
 }

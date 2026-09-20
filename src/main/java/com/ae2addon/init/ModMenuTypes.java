@@ -1,6 +1,7 @@
 package com.ae2addon.init;
 
 import com.ae2addon.AE2Addon;
+import com.ae2addon.gui.AssemblerMenu;
 import com.ae2addon.gui.InfiniteInterfaceMenu;
 import com.ae2addon.gui.IntegratedCPUMenu;
 import com.ae2addon.gui.Mode2ConfigMenu;
@@ -38,4 +39,9 @@ public class ModMenuTypes {
     public static final DeferredHolder<MenuType<?>, MenuType<InfiniteInterfaceMenu>> INFINITE_INTERFACE =
             MENUS.register("infinite_interface",
                     () -> IMenuTypeExtension.create(InfiniteInterfaceMenu::fromNetwork));
+
+    // 装配处理器样板槽界面（v0.3 M3，上游 v1.3.0 同步）
+    public static final DeferredHolder<MenuType<?>, MenuType<AssemblerMenu>> ASSEMBLER =
+            MENUS.register("assembler",
+                    () -> IMenuTypeExtension.create(AssemblerMenu::fromNetwork));
 }

@@ -38,8 +38,9 @@ public record FeederTargetPacket(BlockPos pos, int markerIndex, long target) imp
         context.enqueueWork(() -> {
             var level = context.player().level();
             if (!level.hasChunkAt(msg.pos)) return;
-            if (level.getBlockEntity(msg.pos) instanceof com.ae2addon.block.InfiniteInterfaceBE be) {
-                be.setMarkerTarget(msg.markerIndex, msg.target);
+            var fh = com.ae2addon.network.FeederHostResolver.resolve(level, msg.pos);
+            if (fh != null) {
+                fh.setMarkerTarget(msg.markerIndex, msg.target);
             }
         });
     }

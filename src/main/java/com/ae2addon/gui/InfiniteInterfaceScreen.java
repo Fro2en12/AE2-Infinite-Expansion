@@ -138,10 +138,18 @@ public class InfiniteInterfaceScreen extends AbstractContainerScreen<InfiniteInt
         addRenderableWidget(Button.builder(Component.literal("▶"),
                 b -> getMenu().flipPage(1)
         ).bounds(leftPos + 158, topPos + 4, 16, 12).build());
+        // 「退回网络」按钮（右侧竖排空档，2026-09-06 sensei，上游 v1.3.0+ 同步）：
+        // 把蓄水池全部材料（未喂出的推送料 + 待入网缓存）插回网络存储，
+        // 适用样板发错/任务放弃后材料收不回的情况
+        addRenderableWidget(Button.builder(Component.literal("⇦退网"),
+                b -> PacketDistributor.sendToServer(
+                        new com.ae2addon.network.FeederReturnPacket(
+                                getMenu().getFeeder().getBlockPos()))
+        ).bounds(leftPos + 164, topPos + 82, 36, 12).build());
         long[] values = {
-                AE2AddonConfig.feederStockTarget(),
-                AE2AddonConfig.feederRestockInterval(),
-                AE2AddonConfig.feederFeedBudget()
+                getMenu().getFeeder().stockTargetValue(),
+                getMenu().getFeeder().restockIntervalValue(),
+                getMenu().getFeeder().feedBudgetValue()
         };
         for (int i = 0; i < 3; i++) {
             final int idx = i;

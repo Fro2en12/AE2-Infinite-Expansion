@@ -95,7 +95,7 @@ public class Mode2ConfigGhostHandler implements IGhostIngredientHandler<Mode2Con
             } else if (ModList.get().isLoaded("mekanism")
                     && ingredient instanceof mekanism.api.chemical.ChemicalStack chemical) {
                 // 化学物（气体等）：AEKey 直加白名单
-                var key = com.ae2addon.compat.MekanismGasCompat.keyOfChemical(chemical);
+                var key = com.ae2addon.compat.MekanismChemCompat.keyOfChemical(chemical);
                 if (key != null) {
                     PacketDistributor.sendToServer(new Mode2ConfigPacket(key));
                 }

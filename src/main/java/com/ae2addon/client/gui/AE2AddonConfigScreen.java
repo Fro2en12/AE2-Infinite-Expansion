@@ -47,11 +47,14 @@ public class AE2AddonConfigScreen extends Screen {
         entries.add(new Entry("maxBatchCount — 单订单最大批数", AE2AddonConfig.MAX_BATCH_COUNT, 2, 10_000_000));
         entries.add(new Entry("batchMaxMultiplier — 批量翻倍上限", AE2AddonConfig.BATCH_MAX_MULTIPLIER, 1, Long.MAX_VALUE));
         entries.add(new Entry("sharedExpCap — 经验共享继承上限（0=关）", AE2AddonConfig.SHARED_EXP_CAP, 0, Long.MAX_VALUE));
+        entries.add(new Entry("dispatchBudgetPerTick — 全网格每tick成功push预算（0=不限）", AE2AddonConfig.DISPATCH_BUDGET_PER_TICK, 0, 10_000_000));
         entries.add(new Entry("cheapOrderAmount — 小额免估算阈值", AE2AddonConfig.CHEAP_ORDER_AMOUNT, 1, Long.MAX_VALUE));
         entries.add(new Entry("cellDisplayBytes — 无限元件显示字节", AE2AddonConfig.CELL_DISPLAY_BYTES, 1, Long.MAX_VALUE));
         entries.add(new Entry("infiniteItemAmount — 无限物品真实数量", AE2AddonConfig.INFINITE_ITEM_AMOUNT, 1, Long.MAX_VALUE));
         entries.add(new Entry("cpuDisplayBytes — CPU 显示字节", AE2AddonConfig.CPU_DISPLAY_BYTES, 1, Long.MAX_VALUE));
         entries.add(new Entry("cpuDisplayThreads — CPU 显示线程（0=拉满）", AE2AddonConfig.CPU_DISPLAY_THREADS, 0, 100_000_000));
+        entries.add(new Entry("cpuStorageText — 存储显示文本覆盖（留空=数值/∞）", AE2AddonConfig.CPU_STORAGE_TEXT, 0, 0));
+        entries.add(new Entry("cpuThreadsText — 并行显示文本覆盖（留空=数值/∞）", AE2AddonConfig.CPU_THREADS_TEXT, 0, 0));
         entries.add(new Entry("feederFeedBudget — 接口喂出尝试/tick（发送速度主旋钮）", AE2AddonConfig.FEEDER_FEED_BUDGET, 1, 1_000_000));
         entries.add(new Entry("feederFeedStack — 接口单次喂出堆叠（默认64，大堆叠机器可调大）", AE2AddonConfig.FEEDER_FEED_STACK, 1, Integer.MAX_VALUE));
         entries.add(new Entry("feederRestockInterval — 接口补货间隔 tick（1=最快）", AE2AddonConfig.FEEDER_RESTOCK_INTERVAL, 1, 200));
@@ -59,7 +62,10 @@ public class AE2AddonConfigScreen extends Screen {
         entries.add(new Entry("feederExtractStack — 主动抽取每次物品数（默认64，调大提速）", AE2AddonConfig.FEEDER_EXTRACT_STACK, 1, Integer.MAX_VALUE));
         entries.add(new Entry("feederExtractFluid — 主动抽取每次流体 mB（默认1000）", AE2AddonConfig.FEEDER_EXTRACT_FLUID, 1, Integer.MAX_VALUE));
         entries.add(new Entry("feederExtractGas — 主动抽取每次气体量（默认1000）", AE2AddonConfig.FEEDER_EXTRACT_GAS, 1, Integer.MAX_VALUE));
+        entries.add(new Entry("feederExtractLoopLimit — 主动抽取循环累计上限（0=关）", AE2AddonConfig.FEEDER_EXTRACT_LOOP_CAP, 0, 2_000_000_000));
         entries.add(new Entry("feederStockTarget — 接口补货目标/种（0=关）", AE2AddonConfig.FEEDER_STOCK_TARGET, 0, Long.MAX_VALUE));
+        entries.add(new Entry("feederPowerFeCap — 感应卡单轮供电FE上限（0/1/2速度卡=此值/×16/无上限）", AE2AddonConfig.FEEDER_POWER_FE_CAP, 1, Integer.MAX_VALUE));
+        entries.add(new Entry("feederPowerPassesPerTick — 感应卡每tick供电轮数（1=单轮，N=N×单轮上限）", AE2AddonConfig.FEEDER_POWER_PASSES, 1, 1024));
         entries.add(new Entry("debugLogs — 调试日志", AE2AddonConfig.DEBUG_LOGS, 0, 0));
     }
 
@@ -201,6 +207,13 @@ public class AE2AddonConfigScreen extends Screen {
             Object parsed;
             if (current instanceof Boolean) {
                 parsed = current; // 布尔不走输入框
+                return;
+            }
+            if (current instanceof String) {
+                entry.value().set(text); // 文本项：直接存字符串（2026-09-03）
+                String name = entry.label().split(" — ")[0];
+                showToast("已修改 " + name + " = " + (text.isEmpty() ? "（空）" : text));
+                cancelEdit();
                 return;
             }
             long raw = parseLong(text);

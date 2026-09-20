@@ -59,6 +59,11 @@ public class InfiniteInterfaceBlock extends AEBaseEntityBlock<InfiniteInterfaceB
         if (level.isClientSide) {
             return ItemInteractionResult.sidedSuccess(true);
         }
+        // 手持升级卡右键 = 直接插入（AE2 玩法；2026-09-03 sensei）——先于 GUI/配置卡处理
+        var hostBe = getBlockEntity(level, pos);
+        if (hostBe != null && hostBe.insertUpgradeCard(heldStack)) {
+            return ItemInteractionResult.sidedSuccess(level.isClientSide);
+        }
         if (heldStack.getItem() instanceof com.ae2addon.item.ConfigCardItem
                 || heldStack.getItem() instanceof appeng.items.tools.MemoryCardItem) {
             var be = getBlockEntity(level, pos);

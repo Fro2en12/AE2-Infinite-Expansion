@@ -76,6 +76,11 @@ dependencies {
     compileOnly "mezz.jei:jei-1.21.1-neoforge:19.43.0.390"
     runtimeOnly "mezz.jei:jei-1.21.1-neoforge:19.43.0.390"
 
+    // Jade 15.10.6（NeoForge 1.21.1）— 悬停显示供料站蓄水池
+    // compileOnly 供编译期 API；runtimeOnly 供开发运行，发布后无 Jade 则自动跳过
+    compileOnly "maven.modrinth:jade:15.10.6+neoforge"
+    runtimeOnly "maven.modrinth:jade:15.10.6+neoforge"
+
     // AppliedE 1.0.8-beta（NeoForge 1.21.1）— EMC 通道注册（编译+运行）
     compileOnly "maven.modrinth:appliede:1.0.8-beta"
     runtimeOnly "maven.modrinth:appliede:1.0.8-beta"

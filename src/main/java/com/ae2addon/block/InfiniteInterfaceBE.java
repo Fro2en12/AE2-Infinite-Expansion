@@ -1,109 +1,125 @@
-package com.ae2addon.block;
+    package com.ae2addon.block;
 
-import appeng.api.config.Actionable;
-import appeng.api.crafting.IPatternDetails;
-import appeng.api.crafting.PatternDetailsHelper;
-import appeng.api.networking.GridFlags;
-import appeng.api.networking.IGrid;
-import appeng.api.networking.IManagedGridNode;
-import appeng.api.networking.crafting.ICraftingProvider;
-import appeng.api.networking.security.IActionSource;
-import appeng.api.orientation.BlockOrientation;
-import appeng.api.orientation.RelativeSide;
-import appeng.api.stacks.AEFluidKey;
-import appeng.api.stacks.AEItemKey;
-import appeng.api.stacks.AEKey;
-import appeng.api.stacks.KeyCounter;
-import appeng.api.storage.MEStorage;
-import appeng.blockentity.grid.AENetworkedBlockEntity;
-import appeng.me.helpers.MachineSource;
-import com.ae2addon.config.AE2AddonConfig;
-import com.ae2addon.init.ModBlockEntities;
-import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
-import net.minecraft.core.component.DataComponents;
-import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.ListTag;
-import net.minecraft.nbt.Tag;
-import net.minecraft.world.SimpleContainer;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.component.CustomData;
-import net.minecraft.world.level.Level;
-import net.minecraft.world.level.block.entity.BlockEntity;
-import net.minecraft.world.level.block.state.BlockState;
-import net.neoforged.neoforge.capabilities.Capabilities;
-import net.neoforged.neoforge.capabilities.BlockCapability;
-import net.neoforged.neoforge.fluids.FluidStack;
-import net.neoforged.neoforge.fluids.FluidUtil;
-import net.neoforged.neoforge.fluids.capability.IFluidHandler;
-import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
-import net.neoforged.neoforge.items.IItemHandler;
-import org.jetbrains.annotations.Nullable;
+    import appeng.api.config.Actionable;
+    import appeng.api.crafting.IPatternDetails;
+    import appeng.api.crafting.PatternDetailsHelper;
+    import appeng.api.networking.GridFlags;
+    import appeng.api.networking.IGrid;
+    import appeng.api.networking.IManagedGridNode;
+    import appeng.api.networking.crafting.ICraftingProvider;
+    import appeng.api.networking.security.IActionSource;
+    import appeng.api.orientation.BlockOrientation;
+    import appeng.api.orientation.RelativeSide;
+    import appeng.api.stacks.AEFluidKey;
+    import appeng.api.stacks.AEItemKey;
+    import appeng.api.stacks.AEKey;
+    import appeng.api.stacks.KeyCounter;
+    import appeng.api.storage.MEStorage;
+    import appeng.blockentity.grid.AENetworkedBlockEntity;
+    import appeng.me.helpers.MachineSource;
+    import com.ae2addon.config.AE2AddonConfig;
+    import com.ae2addon.init.ModBlockEntities;
+    import net.minecraft.core.BlockPos;
+    import net.minecraft.core.Direction;
+    import net.minecraft.core.component.DataComponents;
+    import net.minecraft.nbt.CompoundTag;
+    import net.minecraft.nbt.ListTag;
+    import net.minecraft.nbt.Tag;
+    import net.minecraft.world.SimpleContainer;
+    import net.minecraft.world.item.ItemStack;
+    import net.minecraft.world.item.component.CustomData;
+    import net.minecraft.world.level.Level;
+    import net.minecraft.world.level.block.entity.BlockEntity;
+    import net.minecraft.world.level.block.state.BlockState;
+    import net.neoforged.neoforge.capabilities.Capabilities;
+    import net.neoforged.neoforge.capabilities.BlockCapability;
+    import net.neoforged.neoforge.fluids.FluidStack;
+    import net.neoforged.neoforge.fluids.FluidUtil;
+    import net.neoforged.neoforge.fluids.capability.IFluidHandler;
+    import net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction;
+    import net.neoforged.neoforge.items.IItemHandler;
+    import org.jetbrains.annotations.Nullable;
 
-import java.math.BigInteger;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-
-/**
- * ME 接口（无限级）— 机器供料站（被动供料 + CPU 直灌合体）。
- * <p>
- * 三个核心能力（2026-08-28 开工，方案来自 08-27 讨论）：
- * <pre>
- *   ① 被动拉取：相邻机器/漏斗从正面抽 → 蓄水池无单 tick 上限地从网络补足
- *                （每 4 tick 一次，每次拉满缺口，不受原版接口 1 操作/槽/tick 限制）
- *   ② 接收 CPU ScaledPattern N×：实现 ICraftingProvider，pushPattern 无条件收下
- *                （普通 ME 接口是 ICraftingRequester 收不到推送——这是补的洞）
- *   ③ 按机器容量分批喂出：每 tick 把蓄水池物品往正面机器 insertItem，
- *                机器拒收的余量留在蓄水池，天然按机器缓冲上限分批
- * </pre>
- * 配置：正面（FACING 朝向）放样板 = 声明可处理的配方，CPU 会把该配方任务推过来；
- * 同时样板输入 = 自动补货清单（机器消耗后从网络拉回，目标量 config feederStockTarget）。
- * <p>
- * 数据流：CPU ──ScaledPattern N×──► [蓄水池 BigInteger] ──insertItem 分批──► 机器
- *         网络 ──无上限拉取─────────► [蓄水池] ◄──extractItem── 机器/漏斗
- */
-public class InfiniteInterfaceBE extends AENetworkedBlockEntity
-        implements ICraftingProvider, appeng.helpers.patternprovider.PatternContainer,
-        appeng.api.upgrades.IUpgradeableObject,
-        appeng.api.networking.crafting.ICraftingRequester {
-
-    // ── 全局注册表（供 CPU mixin 查询：全量推送判定 / 取消回退） ──
-
-    private static final java.util.Set<InfiniteInterfaceBE> ACTIVE =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
-
-    /** 当前 CPU 任务推送到本接口的材料归属：CPU簇 → 物品 → 数量。 */
-    private final Map<Object, Map<AEKey, BigInteger>> pushedByCluster = new HashMap<>();
+    import java.math.BigInteger;
+    import java.util.ArrayList;
+    import java.util.HashMap;
+    import java.util.HashSet;
+    import java.util.LinkedHashMap;
+    import java.util.List;
+    import java.util.Map;
+    import java.util.Set;
 
     /**
-     * 是否有同网格的无限接口声明了该样板（CPU mixin 全量推送判定用）。
-     * 只查同网格：避免跨网络误判导致全量推给不相干的 provider 全部拒收卡任务。
+     * ME 接口（无限级）— 机器供料站（被动供料 + CPU 直灌合体）。
+     * <p>
+     * 三个核心能力（2026-08-28 开工，方案来自 08-27 讨论）：
+     * <pre>
+     *   ① 被动拉取：相邻机器/漏斗从正面抽 → 蓄水池无单 tick 上限地从网络补足
+     *                （每 4 tick 一次，每次拉满缺口，不受原版接口 1 操作/槽/tick 限制）
+     *   ② 接收 CPU ScaledPattern N×：实现 ICraftingProvider，pushPattern 无条件收下
+     *                （普通 ME 接口是 ICraftingRequester 收不到推送——这是补的洞）
+     *   ③ 按机器容量分批喂出：每 tick 把蓄水池物品往正面机器 insertItem，
+     *                机器拒收的余量留在蓄水池，天然按机器缓冲上限分批
+     * </pre>
+     * 配置：正面（FACING 朝向）放样板 = 声明可处理的配方，CPU 会把该配方任务推过来；
+     * 同时样板输入 = 自动补货清单（机器消耗后从网络拉回，目标量 config feederStockTarget）。
+     * <p>
+     * 数据流：CPU ──ScaledPattern N×──► [蓄水池 BigInteger] ──insertItem 分批──► 机器
+     *         网络 ──无上限拉取─────────► [蓄水池] ◄──extractItem── 机器/漏斗
      */
-    public static boolean hasFeederFor(appeng.api.networking.IGrid grid, IPatternDetails pattern) {
-        if (grid == null || pattern == null) {
-            return false;
-        }
-        for (var be : ACTIVE) {
-            if (be.isRemoved()) {
-                continue;
+    public class InfiniteInterfaceBE extends AENetworkedBlockEntity
+            implements ICraftingProvider, appeng.helpers.patternprovider.PatternContainer,
+            appeng.api.upgrades.IUpgradeableObject,
+            appeng.api.networking.crafting.ICraftingRequester, FeederHost {
+
+        // ── 全局注册表（供 CPU mixin 查询：全量推送判定 / 取消回退） ──
+
+        private static final java.util.Set<InfiniteInterfaceBE> ACTIVE =
+                java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+        /** 当前 CPU 任务推送到本接口的材料归属：CPU簇 → 物品 → 数量。 */
+        private final Map<Object, Map<AEKey, BigInteger>> pushedByCluster = new HashMap<>();
+
+        /**
+         * 是否有同网格的无限接口声明了该样板（CPU mixin 全量推送判定用）。
+         * 只查同网格：避免跨网络误判导致全量推给不相干的 provider 全部拒收卡任务。
+         */
+        public static boolean hasFeederFor(appeng.api.networking.IGrid grid, IPatternDetails pattern) {
+            if (grid == null || pattern == null) {
+                return false;
             }
-            try {
-                if (be.getMainNode().getGrid() != grid) {
+            for (var be : ACTIVE) {
+                if (be.isRemoved()) {
                     continue;
                 }
-                if (be.patterns.contains(pattern)) {
-                    return true;
+                try {
+                    if (be.getMainNode().getGrid() != grid) {
+                        continue;
+                    }
+                    if (be.patterns.contains(pattern)) {
+                        return true;
+                    }
+                } catch (RuntimeException ignored) {
                 }
-            } catch (RuntimeException ignored) {
             }
+            // 线缆面板形态（2026-09-20 本地增强：方块版与面板共用「同网格声明了该样板」判定，
+            // 面板声明的样板也能吃到 N× 全量推送；上游 main 只查方块版 ACTIVE）
+            for (var part : com.ae2addon.part.InfiniteInterfacePart.ACTIVE_PARTS) {
+                if (part == null || part.isRemoved()) {
+                    continue;
+                }
+                try {
+                    if (part.getGrid() != grid) {
+                        continue;
+                    }
+                    if (part.getAvailablePatterns().contains(pattern)) {
+                        return true;
+                    }
+                } catch (RuntimeException ignored) {
+                }
+            }
+            return false;
         }
-        return false;
-    }
 
     /** CPU 任务取消：所有接口把该簇推送的未喂出材料插回网络。 */
     public static void returnPushedFor(Object cluster) {
@@ -144,6 +160,9 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
     public static volatile int EXTRACT_STACK = 64;
     public static volatile int EXTRACT_FLUID = 1000;
     public static volatile int EXTRACT_GAS = 1000;
+
+    /** 主动抽取循环累计上限（0 = 关闭循环，仅单次钳制量；2026-09-03 上游同步）。 */
+    public static volatile int EXTRACT_LOOP_CAP = 1_000_000;
     /** 补货间隔（tick）。4 = 每秒 5 次全量补货。 */
     public static volatile int RESTOCK_INTERVAL = 4;
 
@@ -157,6 +176,7 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
         EXTRACT_STACK = Math.max(1, AE2AddonConfig.feederExtractStack());
         EXTRACT_FLUID = Math.max(1, AE2AddonConfig.feederExtractFluid());
         EXTRACT_GAS = Math.max(1, AE2AddonConfig.feederExtractGas());
+        EXTRACT_LOOP_CAP = AE2AddonConfig.feederExtractLoopCap();
     }
 
     // ── 蓄水池（BigInteger 防溢出；CPU N× 直灌可达 2^63-1/批） ──
@@ -176,6 +196,10 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
     /** 拒收统计：整 tick 零喂出（机器满/拒收）的次数窗口 / 上一秒速率。 */
     private long rejectWindow;
     private long currentRejectRate;
+
+    /** 「蓄水池有货但喂不出」WARN 冷却 tick（同一卡住状态最多每 6000 tick 提示一次，防刷屏）。
+     *  2026-09-20 上游同步（审计补漏）：上游 @@ -176 / @@ -1544。 */
+    private long lastFeederWarnTick = Long.MIN_VALUE;
 
     // ── 样板槽（3×3，声明可处理的配方；CPU 路由靠它） ──
 
@@ -361,6 +385,9 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
 
     /** 蓄水池中当前含样板推送材料的 key（标记喂出关闭时只喂这些）。 */
     private final Set<AEKey> patternKeys = new HashSet<>();
+
+    /** 待入网缓存 key（2026-09-02 上游同步）：输入时网络无空间暂存蓄水池，等空间自动补送；不参与喂机器。 */
+    private final Set<AEKey> pendingNetworkKeys = new HashSet<>();
 
     /** 主动抽取方向（相对面，跟随方块朝向；默认正面保持原行为）。 */
     public appeng.api.orientation.RelativeSide extractSide = appeng.api.orientation.RelativeSide.FRONT;
@@ -600,6 +627,31 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
      */
     @Override
     public boolean pushPattern(IPatternDetails patternDetails, KeyCounter[] inputs) {
+        if (com.ae2addon.crafting.CraftingCompat.debugLogs) {
+            // 诊断（2026-09-06 蓄水池装不住排查）：push 收到什么
+            // 2026-09-20 上游同步（审计补漏）：上游 @@ -590
+            // （纯诊断，仅 debugLogs 开时走；除日志本身外不产生副作用）
+            try {
+                long total = 0;
+                int kinds = 0;
+                if (inputs != null) {
+                    for (KeyCounter kc : inputs) {
+                        for (var e : kc) {
+                            total += e.getLongValue();
+                            kinds++;
+                        }
+                    }
+                }
+                com.ae2addon.AE2Addon.LOGGER.info(
+                        "[ae2addon][feeder][diag] BE pushPattern: pattern={} inputs={}({}种/{}) pusher={}",
+                        patternDetails == null ? "null" : patternDetails.getClass().getSimpleName(),
+                        inputs == null ? "null" : inputs.length,
+                        kinds, total,
+                        com.ae2addon.crafting.CraftingCompat.currentPushingCluster == null ? "null" : "set");
+            } catch (RuntimeException ignored) {
+                // 诊断块绝不影响 pushPattern 主流程
+            }
+        }
         long inputCount = 0;
         long inputTypes = 0;
         Object pusher = com.ae2addon.crafting.CraftingCompat.currentPushingCluster;
@@ -637,9 +689,13 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
         return true;
     }
 
-    /** 取消回退：把指定 CPU 簇推送、尚未喂出的材料插回网络。 */
+    /** 取消回退：把指定 CPU 簇推送、尚未喂出的材料插回网络（不丢料加固）。
+     *  2026-09-20 上游同步（审计补漏 P0-1）：上游 @@ -636。旧版三处实害：
+     *  ① pushedByCluster.remove 先删记账 → 拒收/断网时记账丢失、无处重试；
+     *  ② storage==null 时仍扣蓄水池 → 材料凭空销毁；
+     *  ③ 缺 inserted&lt;back 余额写回 / it.remove() 清理 / 「全退完才删簇账」。 */
     private void returnPushedForCluster(Object cluster) {
-        Map<AEKey, BigInteger> pushed = pushedByCluster.remove(cluster);
+        Map<AEKey, BigInteger> pushed = pushedByCluster.get(cluster);
         if (pushed == null || pushed.isEmpty()) {
             return;
         }
@@ -647,25 +703,37 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
         appeng.api.storage.MEStorage storage = grid == null
                 ? null : grid.getStorageService().getInventory();
         BigInteger returned = BigInteger.ZERO;
-        for (var entry : pushed.entrySet()) {
+        java.util.Iterator<Map.Entry<AEKey, BigInteger>> it = pushed.entrySet().iterator();
+        while (it.hasNext()) {
+            var entry = it.next();
             AEKey key = entry.getKey();
             long have = reservoirAmount(key);
             long back = entry.getValue()
                     .min(BigInteger.valueOf(have))
                     .min(BigInteger.valueOf(Long.MAX_VALUE)).longValue();
             if (back <= 0) {
+                it.remove(); // 池里已无该料（已喂出/已退）：清记账防滞留重试空转
                 continue;
             }
-            if (storage != null) {
-                long inserted = storage.insert(key, back, Actionable.MODULATE, actionSource);
-                if (inserted > 0) {
-                    subtractReservoir(key, inserted);
-                    returned = returned.add(BigInteger.valueOf(inserted));
-                }
-            } else {
-                subtractReservoir(key, back);
-                returned = returned.add(BigInteger.valueOf(back));
+            if (storage == null) {
+                // 断网：不退不扣，记账保留 → 周期重试（不丢料，2026-09-08 加固）
+                break;
             }
+            long inserted = storage.insert(key, back, Actionable.MODULATE, actionSource);
+            if (inserted > 0) {
+                subtractReservoir(key, inserted);
+                returned = returned.add(BigInteger.valueOf(inserted));
+                long remain = entry.getValue().subtract(BigInteger.valueOf(inserted)).longValue();
+                if (remain <= 0) {
+                    it.remove(); // 该 key 全部退完
+                } else {
+                    entry.setValue(BigInteger.valueOf(remain)); // 部分退：记账保留余量
+                }
+            }
+            // inserted == 0：网络拒收（满/瞬态），记账保留 → 周期重试
+        }
+        if (pushed.isEmpty()) {
+            pushedByCluster.remove(cluster); // 全部退完才删簇账
         }
         if (returned.signum() > 0) {
             setChanged();
@@ -673,6 +741,21 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                     "[ae2addon][feeder] CPU任务取消，材料回退网络 {} 个（{}种），剩余蓄水池={}种/合计{}",
                     fmt(returned), pushed.size(), reservoirSummary()[0],
                     fmt(totalAmount()));
+        }
+    }
+
+    /** 滞留回退重试：断网/拒收时没退完的簇记账，网格恢复后自动补退（每 20 tick）。
+     *  2026-09-20 上游同步（审计补漏 P0-2）：上游 @@ -665。 */
+    private void retryPendingReturns() {
+        if (pushedByCluster.isEmpty()) {
+            return;
+        }
+        IGrid grid = getMainNode().getGrid();
+        if (grid == null) {
+            return; // 仍断网，等下次
+        }
+        for (Object cluster : new java.util.ArrayList<>(pushedByCluster.keySet())) {
+            returnPushedForCluster(cluster); // 保留的记账会重试，退完自动删
         }
     }
 
@@ -687,6 +770,125 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
     @Override
     public appeng.api.upgrades.IUpgradeInventory getUpgrades() {
         return upgrades;
+    }
+
+    // ── FeederHost 接口实现（2026-09-02 part 面板解耦：GUI/菜单/Screen 经接口访问） ──
+
+    @Override
+    public boolean activeExtract() {
+        return activeExtract;
+    }
+
+    @Override
+    public boolean activeFeed() {
+        return activeFeed;
+    }
+
+    @Override
+    public boolean activeMarkerFeed() {
+        return activeMarkerFeed;
+    }
+
+    @Override
+    public appeng.api.orientation.RelativeSide extractSide() {
+        return extractSide;
+    }
+
+    @Override
+    public long pStockTarget() {
+        return pStockTarget;
+    }
+
+    @Override
+    public void pStockTarget(long v) {
+        pStockTarget = v;
+        setChanged();
+    }
+
+    @Override
+    public int pRestockInterval() {
+        return pRestockInterval;
+    }
+
+    @Override
+    public void pRestockInterval(int v) {
+        pRestockInterval = v;
+        setChanged();
+    }
+
+    @Override
+    public int pFeedBudget() {
+        return pFeedBudget;
+    }
+
+    @Override
+    public void pFeedBudget(int v) {
+        pFeedBudget = v;
+        setChanged();
+    }
+
+    @Override
+    public void setActiveExtract(boolean v) {
+        activeExtract = v;
+        setChanged();
+    }
+
+    @Override
+    public void setActiveFeed(boolean v) {
+        activeFeed = v;
+        setChanged();
+    }
+
+    @Override
+    public void setExtractSide(appeng.api.orientation.RelativeSide side) {
+        extractSide = side;
+        setChanged();
+    }
+
+    /** 手动「退回网络」（2026-09-06 sensei，上游 v1.3.0+）：蓄水池全部材料插回网络。 */
+    @Override
+    public boolean returnAllToNetwork() {
+        if (level == null || level.isClientSide) {
+            return false;
+        }
+        IGrid grid = getMainNode().getGrid();
+        MEStorage storage = grid == null ? null : grid.getStorageService().getInventory();
+        if (storage == null) {
+            return false; // 未连网退不回（料留在蓄水池，不丢）
+        }
+        BigInteger returned = BigInteger.ZERO;
+        int types = 0;
+        int stuck = 0;
+        for (AEKey key : new java.util.ArrayList<>(reservoir.keySet())) {
+            long amt = reservoirAmount(key);
+            if (amt <= 0) {
+                continue;
+            }
+            long inserted = storage.insert(key, amt, Actionable.MODULATE, actionSource);
+            if (inserted > 0) {
+                subtractReservoir(key, inserted);
+                returned = returned.add(BigInteger.valueOf(inserted));
+                if (reservoirAmount(key) <= 0) {
+                    types++;
+                }
+            } else {
+                stuck++; // 网络拒收（满/不可存）→ 留在蓄水池待下次
+            }
+        }
+        pushedByCluster.clear(); // 手动全退：簇推送记账作废，防 CPU cancel 二次回退
+        if (returned.signum() > 0) {
+            setChanged();
+            com.ae2addon.AE2Addon.LOGGER.info(
+                    "[ae2addon][feeder] 手动退回网络 {} 个（{}种清空，{}种拒收留池）→ 蓄水池剩余{}/合计{}",
+                    fmt(returned), types, stuck, reservoirSummary()[0], fmt(totalAmount()));
+            return true;
+        }
+        return false;
+    }
+
+    @Override
+    public java.util.List<net.minecraft.network.chat.Component> reservoirTooltipLines() {
+        return FeederHost.buildReservoirLines(reservoir);
     }
 
     // ── 网络入口（2026-08-28 sensei：接口当然要有入口）──
@@ -734,15 +936,12 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                                 key, stack.getCount(),
                                 simulate ? Actionable.SIMULATE : Actionable.MODULATE,
                                 actionSource);
-                        if (inserted <= 0) {
-                            return stack;
+                        // 网络空间不足的余量：收进蓄水池待入网缓存（等空间自动补送），不拒收（2026-09-02 上游同步）
+                        long rest = stack.getCount() - inserted;
+                        if (rest > 0 && !simulate) {
+                            cacheForNetwork(key, rest);
                         }
-                        if (inserted >= stack.getCount()) {
-                            return net.minecraft.world.item.ItemStack.EMPTY;
-                        }
-                        net.minecraft.world.item.ItemStack rest = stack.copy();
-                        rest.setCount(stack.getCount() - (int) inserted);
-                        return rest;
+                        return net.minecraft.world.item.ItemStack.EMPTY; // 全接收（入网 + 缓存）
                     } catch (RuntimeException e) {
                         return stack;
                     }
@@ -835,7 +1034,12 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                                 key, resource.getAmount(),
                                 action.simulate() ? Actionable.SIMULATE : Actionable.MODULATE,
                                 actionSource);
-                        return (int) inserted;
+                        // 网络空间不足的余量：收进蓄水池待入网缓存（等空间自动补送），不拒收（2026-09-02 上游同步）
+                        long rest = resource.getAmount() - inserted;
+                        if (rest > 0 && !action.simulate()) {
+                            cacheForNetwork(key, rest);
+                        }
+                        return resource.getAmount(); // 全接收（入网 + 缓存）
                     } catch (RuntimeException e) {
                         return 0;
                     }
@@ -912,7 +1116,12 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                 appeng.core.definitions.AEItems.CAPACITY_CARD.asItem());
     }
 
-    /** 速度卡数量（0-2）：每张喂出预算 ×2。 */
+    /** 速度卡数量（0-2）：感应卡供电倍率（1张×16，2张每轮无上限）。 */
+    public int speedCards() {
+        return upgrades.getInstalledUpgrades(
+                appeng.core.definitions.AEItems.SPEED_CARD.asItem());
+    }
+
     /** 当前活动的样板槽数（9 + 容量卡×9，分页显示）。 */
     public int activePatternSlots() {
         return 9 + capacityCards() * 9;
@@ -987,7 +1196,7 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                 }
             }
         }
-        channelLink.update(this, cardStack);
+        channelLink.update(() -> this, () -> getMainNode().getNode(), cardStack);
     }
 
     private void disconnectChannelLink() {
@@ -1126,14 +1335,23 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
             feederDiagLogged = true;
             logFeederStatus("启动");
         } else if ((lvl.getGameTime() & 0x3F) == 0
-                && com.ae2addon.config.AE2AddonConfig.debugLogs()) {
-            logFeederStatus("心跳"); // 每 64 tick（约 3 秒）一条，仅 debugLogs 开
+                && com.ae2addon.config.AE2AddonConfig.debugLogs()
+                && totalAmount().signum() > 0) {
+            // 心跳仅蓄水池非空时打（2026-09-06 sensei：空池心跳刷屏干扰观察）
+            // 2026-09-20 上游同步（审计补漏 P1-2）：上游 @@ -1144
+            logFeederStatus("心跳"); // 每 64 tick（约 3 秒）一条，仅 debugLogs 开且池非空
         }
         if ((lvl.getGameTime() % restockIntervalValue()) == 0) {
             restockFromNetwork();
         }
         if ((lvl.getGameTime() % EXTRACT_INTERVAL) == 0) {
             extractFromMachine(); // 主动抽取：可配置方向/间隔（默认每 4 tick）
+        }
+        if ((lvl.getGameTime() % 10) == 0) {
+            pushPendingToNetwork(); // 待入网缓存自动补送（网络有空间即送出，2026-09-02 上游同步）
+        }
+        if ((lvl.getGameTime() % 20) == 0) {
+            retryPendingReturns(); // 取消回退滞留重试（断网/拒收恢复后自动补退，2026-09-20 上游同步：审计补漏 P0-2）
         }
         feedMachinePower(); // 感应卡供电独立于喂出（蓄水池空也供电）
         feedMachine();
@@ -1358,7 +1576,7 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                 continue;
             }
             // 气体容器（气罐/气桶）→ 标记内部气体
-            AEKey gasKey = com.ae2addon.compat.MekanismGasCompat.chemicalInContainer(stack);
+            AEKey gasKey = com.ae2addon.compat.MekanismChemCompat.chemicalInContainer(stack);
             if (gasKey != null) {
                 keys.add(gasKey);
                 continue;
@@ -1436,6 +1654,9 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
             if ((entry.getKey() instanceof AEItemKey || entry.getKey() instanceof AEFluidKey
                     || com.ae2addon.compat.MekanismGasCompat.isFeedable(entry.getKey()))
                     && entry.getValue().signum() > 0) {
+                if (pendingNetworkKeys.contains(entry.getKey())) {
+                    continue; // 待入网缓存不喂机器（2026-09-02 上游同步）
+                }
                 if (!activeMarkerFeed && !patternKeys.contains(entry.getKey())) {
                     continue; // 标记喂出关闭：标记缓存不计入可喂（只喂样板）
                 }
@@ -1457,6 +1678,9 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
             if (remain.signum() <= 0) {
                 it.remove();
                 continue;
+            }
+            if (pendingNetworkKeys.contains(key)) {
+                continue; // 待入网缓存不喂机器（2026-09-02 上游同步）
             }
             if (!activeMarkerFeed && !patternKeys.contains(key)) {
                 continue; // 标记喂出关闭：标记补货缓存留蓄水池，不占机器格子
@@ -1499,7 +1723,7 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
             } else if (com.ae2addon.compat.MekanismGasCompat.isFeedable(key)) {
                 // 气体喂出：insertChemical 到机器气体槽（Mekanism 可选集成）
                 while (amount > 0 && itemBudget > 0 && totalBudget > 0) {
-                    long fedOnce = com.ae2addon.compat.MekanismGasCompat.feed(
+                    long fedOnce = com.ae2addon.compat.MekanismChemCompat.feed(
                             target, front.getOpposite(), key, amount);
                     if (fedOnce <= 0) {
                         break; // 机器气体槽满/不吃该气体
@@ -1534,9 +1758,13 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
         } else {
             rejectWindow++; // 有货但整 tick 零喂出 → 机器满/拒收（诊断瓶颈）
             // 诊断：蓄水池含流体/气体但喂不出（机器无对应槽 or 拒收）
-            if (hasUnfedFluidOrGas() && (level.getGameTime() & 0x7F) == 0) {
+            // 限流：同一卡住状态最多每 6000 tick（5 分钟）warn 一次，防刷屏（2026-09-02）
+            // 2026-09-20 上游同步（审计补漏 P1-1）：上游 @@ -1544
+            long nowTick = level.getGameTime();
+            if (hasUnfedFluidOrGas() && nowTick - lastFeederWarnTick >= 6000) {
+                lastFeederWarnTick = nowTick;
                 com.ae2addon.AE2Addon.LOGGER.warn(
-                        "[ae2addon][feeder] 蓄水池含流体/气体但未喂出：物品槽={} 流体槽={} 气体可喂={}，"
+                        "[ae2addon][feeder] 蓄水池含流体/气体但未喂出（5分钟内不再重复提示）：物品槽={} 流体槽={} 气体可喂={}，"
                                 + "蓄水池={}种/合计{}",
                         handler != null, fluidHandler != null,
                         com.ae2addon.compat.MekanismGasCompat.isLoaded(),
@@ -1581,59 +1809,67 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                 if (handler.getSlots() > 0) {
                     boolean found = false;
                     for (int slot = 0; slot < handler.getSlots(); slot++) {
-                        var extracted = handler.extractItem(slot, EXTRACT_STACK, true);
-                        if (extracted.isEmpty()) {
+                        // 防回流 probe：直接看槽内容（不触发 simulate——巨型容器的
+                        // simulate 会虚报可抽量，2026-09-06 sensei 实测：容器实际 1 个
+                        // 却按 loopCap 虚报 → 先入网后真抽导致差额凭空复制；上游同步）
+                        var probe = handler.getStackInSlot(slot);
+                        if (probe.isEmpty()) {
                             continue;
                         }
-                        var key = appeng.api.stacks.AEItemKey.of(extracted);
-                        if (key == null) {
-                            continue;
-                        }
-                        if (isMarkedMaterial(key)) {
+                        var probeKey = appeng.api.stacks.AEItemKey.of(probe);
+                        if (probeKey == null || isMarkedMaterial(probeKey)) {
                             continue; // 材料不抽（防回流）
                         }
-                        // ⚠️ 部分机器的 IItemHandler 把单次 extractItem 钳制在物品最大堆叠
-                        // （Mekanism 箱子/箱柜 = min(槽内数量, maxStackSize)，原版物品=64），
-                        // 配置的每次抽取量一次拿不完 → 循环试探凑满（2026-08-29 sensei 实测 1024 只出 64）。
-                        // 先模拟收集可抽总量（一次入网），再按网络实际接收量实抽。
-                        int remaining = EXTRACT_STACK;
-                        long available = 0;
+                        // 真实抽取（EXECUTE）：每轮拿到的都是容器真实给出的量，
+                        // 循环累计（部分机器把单次 extractItem 钳制在 maxStackSize）。
+                        // 拿到多少算多少，按实得入网 → 巨型容器虚报也无法复制。
+                        long remaining = Math.min(probe.getCount(), (long) EXTRACT_STACK);
+                        long gotTotal = 0;
+                        boolean looping = EXTRACT_LOOP_CAP > 0; // 0 = 关循环，仅单次钳制量
                         int guard = 0;
-                        while (remaining > 0 && guard++ < 65536) {
-                            var part = handler.extractItem(slot, remaining, true);
-                            if (part.isEmpty()) {
+                        do {
+                            int want = (int) Math.min(remaining,
+                                    looping ? (long) EXTRACT_LOOP_CAP - gotTotal : remaining);
+                            if (want <= 0) {
                                 break;
+                            }
+                            var part = handler.extractItem(slot, want, false);
+                            if (part.isEmpty()) {
+                                break; // 槽被抽空/拒给
                             }
                             var partKey = appeng.api.stacks.AEItemKey.of(part);
-                            if (partKey == null || !partKey.equals(key)) {
-                                break; // 槽内容变化（防御）
-                            }
-                            int n = Math.min(part.getCount(), remaining);
-                            if (n <= 0) {
+                            if (partKey == null || !partKey.equals(probeKey)) {
+                                // 槽内容变化（防御）：抽出的异物塞回，避免截留/错乱
+                                try {
+                                    ItemStack rest = handler.insertItem(slot, part, false);
+                                    if (!rest.isEmpty()) {
+                                        cacheForNetwork(partKey, rest.getCount()); // 塞不回则缓存（不丢）
+                                    }
+                                } catch (RuntimeException ignored) {
+                                }
                                 break;
                             }
-                            available += n;
+                            int n = part.getCount();
+                            gotTotal += n;
                             remaining -= n;
-                        }
-                        if (available <= 0) {
+                        } while (looping && remaining > 0 && gotTotal < EXTRACT_LOOP_CAP
+                                && guard++ < 65536);
+                        if (gotTotal <= 0) {
                             continue;
                         }
+                        // 按真实抽到的量入网；插不进的走待入网缓存（网络满不卡机器）
                         long inserted = storage.insert(
-                                key, available, Actionable.MODULATE, actionSource);
-                        if (inserted > 0) {
-                            // 按网络实收量从机器取出（单次仍可能被钳制，循环取）
-                            int toExtract = (int) Math.min(inserted, Integer.MAX_VALUE);
-                            while (toExtract > 0) {
-                                var got = handler.extractItem(slot, toExtract, false);
-                                if (got.isEmpty()) {
-                                    break;
-                                }
-                                toExtract -= Math.min(got.getCount(), toExtract);
+                                probeKey, gotTotal, Actionable.MODULATE, actionSource);
+                        long cached = gotTotal - inserted;
+                        if (inserted > 0 || cached > 0) {
+                            if (cached > 0) {
+                                cacheForNetwork(probeKey, cached);
                             }
                             found = true;
                             com.ae2addon.AE2Addon.LOGGER.info(
-                                    "[ae2addon][feeder] 主动抽取: {} x{} → 网络（槽{}）",
-                                    key, inserted, slot);
+                                    "[ae2addon][feeder] 主动抽取: {} x{} → 网络{}（槽{}）",
+                                    probeKey, inserted,
+                                    cached > 0 ? " + 缓存" + cached : "", slot);
                         }
                     }
                     if (!found && (level.getGameTime() & 0xFF) == 0) {
@@ -1665,24 +1901,28 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                         if (key == null || isMarkedMaterial(key)) {
                             continue;
                         }
-                        long amount = Math.min(inTank.getAmount(), EXTRACT_FLUID);
-                        if (amount <= 0) {
+                        // 先真实 drain 再入网（2026-09-06 上游同步：simulate 虚报会导致差额复制，
+                        // 与物品段同理——按实得量入网，插不进的走待入网缓存）
+                        int want = (int) Math.min(inTank.getAmount(), (long) EXTRACT_FLUID);
+                        if (want <= 0) {
                             continue;
                         }
                         var drained = fluidHandler.drain(new net.neoforged.neoforge.fluids.FluidStack(
-                                inTank.getFluid(), (int) amount),
-                                net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction.SIMULATE);
+                                inTank.getFluid(), want),
+                                net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction.EXECUTE);
                         if (drained.isEmpty()) {
                             continue;
                         }
-                        long inserted = storage.insert(
-                                key, drained.getAmount(), Actionable.MODULATE, actionSource);
-                        if (inserted > 0) {
-                            fluidHandler.drain(new net.neoforged.neoforge.fluids.FluidStack(
-                                    inTank.getFluid(), (int) inserted),
-                                    net.neoforged.neoforge.fluids.capability.IFluidHandler.FluidAction.EXECUTE);
+                        long got = drained.getAmount();
+                        long inserted = storage.insert(key, got, Actionable.MODULATE, actionSource);
+                        long cached = got - inserted;
+                        if (inserted > 0 || cached > 0) {
+                            if (cached > 0) {
+                                cacheForNetwork(key, cached);
+                            }
                             com.ae2addon.AE2Addon.LOGGER.info(
-                                    "[ae2addon][feeder] 主动抽取: {} {}mB → 网络（罐{}）", key, inserted, tank);
+                                    "[ae2addon][feeder] 主动抽取: {} {}mB → 网络{}（罐{}）", key, inserted,
+                                    cached > 0 ? " + 缓存" + cached : "", tank);
                         }
                     }
                 }
@@ -1711,27 +1951,33 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
             if (inTank == null || inTank.isEmpty()) {
                 continue;
             }
-            AEKey key = com.ae2addon.compat.MekanismGasCompat.keyOfChemical(inTank);
+            AEKey key = com.ae2addon.compat.MekanismChemCompat.keyOfChemical(inTank);
             if (key == null || isMarkedMaterial(key)) {
                 continue;
             }
-            long amount = Math.min(inTank.getAmount(), EXTRACT_GAS);
-            if (amount <= 0) {
+            long want = Math.min(inTank.getAmount(), EXTRACT_GAS);
+            if (want <= 0) {
                 continue;
             }
-            var sim = ch.extractChemical(tank, amount, mekanism.api.Action.SIMULATE);
-            if (sim == null || sim.isEmpty()) {
+            // 先真实 EXECUTE 抽取再入网（2026-09-06 上游同步：simulate 虚报 → 差额复制，
+            // 与物品/流体段同理——按实得量入网，插不进的走待入网缓存）
+            var real = ch.extractChemical(tank, want, mekanism.api.Action.EXECUTE);
+            if (real == null || real.isEmpty()) {
                 continue;
             }
-            long got = Math.min(sim.getAmount(), amount);
+            long got = Math.min(real.getAmount(), want);
             if (got <= 0) {
                 continue;
             }
             long inserted = storage.insert(key, got, Actionable.MODULATE, actionSource);
-            if (inserted > 0) {
-                ch.extractChemical(tank, inserted, mekanism.api.Action.EXECUTE);
+            long cached = got - inserted;
+            if (inserted > 0 || cached > 0) {
+                if (cached > 0) {
+                    cacheForNetwork(key, cached);
+                }
                 com.ae2addon.AE2Addon.LOGGER.info(
-                        "[ae2addon][feeder] 主动抽取: {} {}单位 → 网络（罐{}）", key, inserted, tank);
+                        "[ae2addon][feeder] 主动抽取: {} {}单位 → 网络{}（罐{}）", key, inserted,
+                        cached > 0 ? " + 缓存" + cached : "", tank);
             }
         }
     }
@@ -1740,6 +1986,11 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
     private boolean isMarkedMaterial(AEKey key) {
         if (wantedKeys().contains(key)) {
             return true;
+        }
+        // 待入网缓存（从容器抽出的产物，网络满暂存）不防回流：否则缓存未送完期间
+        // 容器里新产的同种产物会被误当「喂入材料」不再抽（2026-09-06 sensei 实测，上游同步）
+        if (pendingNetworkKeys.contains(key)) {
+            return false;
         }
         var have = reservoir.get(key);
         return have != null && have.signum() > 0;
@@ -1777,11 +2028,18 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
             if (target == null) {
                 return;
             }
+            long cap = com.ae2addon.config.AE2AddonConfig.feederPowerEffectiveFeCap(
+                    speedCards());
+            int passes = com.ae2addon.config.AE2AddonConfig.feederPowerPasses();
             long fe = com.ae2addon.compat.AppFluxPowerCompat.feedEnergy(
-                    target, front.getOpposite(), getMainNode().getGrid(), actionSource);
+                    target, front.getOpposite(), getMainNode().getGrid(), actionSource,
+                    passes, cap);
             if (fe > 0 && (level.getGameTime() & 0x3F) == 0) {
+                int accel = speedCards();
+                String mode = accel >= 2 ? "无上限" : accel == 1 ? "×16" : "config";
                 com.ae2addon.AE2Addon.LOGGER.info(
-                        "[ae2addon][feeder] 供电 {} FE/tick（感应卡）", fe);
+                        "[ae2addon][feeder] 供电 {} FE/tick（感应卡，{}轮，{}速度卡={}）",
+                        fe, passes, accel, mode);
             }
         } catch (RuntimeException ignored) {
         }
@@ -1791,6 +2049,9 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
     private boolean hasUnfedFluidOrGas() {
         for (var entry : reservoir.entrySet()) {
             AEKey key = entry.getKey();
+            if (pendingNetworkKeys.contains(key)) {
+                continue; // 待入网缓存不算「该喂未喂」（2026-09-02 上游同步）
+            }
             if ((key instanceof AEFluidKey
                     || com.ae2addon.compat.MekanismGasCompat.isFeedable(key))
                     && entry.getValue().signum() > 0) {
@@ -1812,6 +2073,50 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
         reservoir.merge(key, amount, BigInteger::add);
     }
 
+    /** 待入网暂存（2026-09-02 上游同步）：网络满时输入材料先进蓄水池（标记待补送；不喂机器）。 */
+    private void cacheForNetwork(AEKey key, long amount) {
+        if (amount <= 0) {
+            return;
+        }
+        addReservoir(key, BigInteger.valueOf(amount));
+        pendingNetworkKeys.add(key);
+        setChanged();
+    }
+
+    /** 自动补送：把待入网缓存送进网络（网络有空间即出；每 10 tick 由 serverTick 调）。 */
+    private void pushPendingToNetwork() {
+        if (pendingNetworkKeys.isEmpty()) {
+            return;
+        }
+        IGrid grid = getMainNode().getGrid();
+        if (grid == null) {
+            return;
+        }
+        var storage = grid.getStorageService().getInventory();
+        // 快照遍历：subtractReservoir 会在条目清空时移除 pendingNetworkKeys（防 CME）
+        for (AEKey key : new java.util.ArrayList<>(pendingNetworkKeys)) {
+            BigInteger amt = reservoir.get(key);
+            if (amt == null || amt.signum() <= 0) {
+                pendingNetworkKeys.remove(key);
+                continue;
+            }
+            long want = amt.min(BigInteger.valueOf(Integer.MAX_VALUE)).longValue();
+            if (want <= 0) {
+                continue;
+            }
+            long inserted;
+            try {
+                inserted = storage.insert(key, want, Actionable.MODULATE, actionSource);
+            } catch (RuntimeException e) {
+                continue; // 异常条目保留待下次
+            }
+            if (inserted > 0) {
+                subtractReservoir(key, inserted); // 全清时自动退 pendingNetworkKeys；剩余留待下次
+                setChanged();
+            }
+        }
+    }
+
     private void subtractReservoir(AEKey key, long amount) {
         if (amount <= 0) {
             return;
@@ -1820,6 +2125,7 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
             BigInteger next = v.subtract(BigInteger.valueOf(amount));
             if (next.signum() <= 0) {
                 patternKeys.remove(key);
+                pendingNetworkKeys.remove(key);
                 return null;
             }
             return next;
@@ -1861,6 +2167,11 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
     private void onMarkersChanged() {
         setChanged();
         // 标记区不占真实存储：标记取消 → 对应蓄水池缓存退回网络（2026-08-28 sensei）
+        // 2026-09-20 上游同步（审计补漏 P0-4）：本方法已按上游 @@ -1836 加固——
+        // ① patternKeys 守卫 ② inserted<back 余量放回 ③ catch 回滚整笔。
+        // ⚠️ 另有一处与上游不同、按上游对齐的细节：上游把 reservoir.remove 放在
+        // storage != null 之内（断网时不从蓄水池摘除，留作缓存）；本地为「先摘再判」，
+        // 断网路径会静默丢料，本次一并按上游口径修正为「仅在 storage 非空时摘除」。
         java.util.Set<AEKey> now = wantedKeys();
         if (level == null || level.isClientSide || now.equals(lastMarkedKeys)) {
             lastMarkedKeys = now;
@@ -1873,17 +2184,29 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                 if (now.contains(gone)) {
                     continue;
                 }
+                if (patternKeys.contains(gone)) {
+                    continue; // 样板喂料中的材料不退（2026-09-02：防取消标记误退喂料致机器断料）
+                }
+                if (storage == null) {
+                    continue; // 断网：不从蓄水池摘除（留作缓存，等网络回来再退；不丢料）
+                }
                 java.math.BigInteger amount = reservoir.remove(gone);
-                if (amount != null && amount.signum() > 0 && storage != null) {
+                if (amount != null && amount.signum() > 0) {
                     try {
                         long back = amount.min(java.math.BigInteger.valueOf(Long.MAX_VALUE)).longValue();
                         long inserted = storage.insert(gone, back, Actionable.MODULATE, actionSource);
+                        if (inserted < back) {
+                            // 网络空间不足：未退回部分放回蓄水池，不丢（2026-09-02）
+                            java.math.BigInteger left = java.math.BigInteger.valueOf(back - inserted);
+                            reservoir.merge(gone, left, java.math.BigInteger::add);
+                        }
                         com.ae2addon.AE2Addon.LOGGER.info(
                                 "[ae2addon][feeder] 标记取消，退回缓存 {} x{}（蓄水池余 {}）",
                                 gone, inserted, reservoirAmount(gone));
                     } catch (RuntimeException e) {
                         com.ae2addon.AE2Addon.LOGGER.warn(
                                 "[ae2addon][feeder] 退回缓存失败 {} {}", gone, e);
+                        reservoir.merge(gone, amount, java.math.BigInteger::add); // 回滚防丢
                     }
                 }
             }
@@ -1897,6 +2220,12 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
      * 普通物品放 1 个作视觉；空手右键 = 清空标记。
      */
     public boolean handleMarkerRightClick(int markerIndex, ItemStack carried) {
+        return handleMarkerClick(markerIndex, carried, true);
+    }
+
+    /** 标记槽点击（FeederHost）：content=true（右键）= 容器内容物优先；false（左键）= 一律标记本体。 */
+    @Override
+    public boolean handleMarkerClick(int markerIndex, ItemStack carried, boolean content) {
         if (markerIndex < 0 || markerIndex >= markerInv.getContainerSize()) {
             return false;
         }
@@ -1904,19 +2233,20 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
             markerInv.setItem(markerIndex, ItemStack.EMPTY);
             return true;
         }
-        // 流体容器 → 标记流体
-        var contained = FluidUtil.getFluidContained(carried);
-        if (contained.isPresent() && !contained.get().isEmpty()) {
-            markByKey(markerIndex, AEFluidKey.of(contained.get()));
-            return true;
+        if (content) {
+            // 右键：容器内容物优先（流体/气体容器 → 内容物）
+            var contained = FluidUtil.getFluidContained(carried);
+            if (contained.isPresent() && !contained.get().isEmpty()) {
+                markByKey(markerIndex, AEFluidKey.of(contained.get()));
+                return true;
+            }
+            AEKey gasKey = com.ae2addon.compat.MekanismChemCompat.chemicalInContainer(carried);
+            if (gasKey != null) {
+                markByKey(markerIndex, gasKey);
+                return true;
+            }
         }
-        // 气体容器（气罐/气桶）→ 标记气体
-        AEKey gasKey = com.ae2addon.compat.MekanismGasCompat.chemicalInContainer(carried);
-        if (gasKey != null) {
-            markByKey(markerIndex, gasKey);
-            return true;
-        }
-        // 普通物品 → 虚拟标记（WrappedGenericStack，不占用真实物品）
+        // 普通物品 / 左键：一律标记本体（WrappedGenericStack，不占用真实物品）
         var itemKey = appeng.api.stacks.AEItemKey.of(carried);
         if (itemKey != null) {
             markByKey(markerIndex, itemKey);
@@ -2061,97 +2391,138 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
     // ── 化学物侧面抽取（Mekanism 10.7 统一 IChemicalHandler；气体/灌注/颜料/浆液
     //    已不再分形态，单一 CHEMICAL 能力；drain 从蓄水池扣化学物） ──
 
-    private final mekanism.api.chemical.IChemicalHandler networkChemicalHandler =
-            new mekanism.api.chemical.IChemicalHandler() {
-                @Override
-                public int getChemicalTanks() {
-                    return 1;
-                }
+    /**
+     * 惰性持有的化学能力入口（Mekanism 可选集成）。
+     * <p>
+     * 2026-09-20 上游同步（审计补漏 P0-6，上游 @@ -2018 大重构的动机）：原为
+     * {@code private final IChemicalHandler networkChemicalHandler = new ...{...}}
+     * ——final 字段在 BE 构造时初始化，无 Mekanism 环境下放置/加载该方块就会解析
+     * mekanism 符号，存在 NoClassDefFoundError 风险（AE2Addon 的 isLoaded 守卫只保护
+     * 注册期，管不到 BE 构造）。现改为 @Nullable 字段 + 惰性创建：实例只在
+     * getChemHandler(...)（仅 isLoaded 时被 AE2Addon 调用）里首次构造，实现与 Mekanism
+     * 符号全部关在 static 内部类 ChemHandlerHolder 里，不触发创建就永不解析。
+     * 对外方法签名与行为保持不变（保持 1.21.1 统一 IChemicalHandler 路线，
+     * 不照搬上游 1.20.1 的 GasStack/InfusionStack 分形态写法）。
+     */
+    @Nullable
+    private Object networkChemicalHandler;
 
-                @Override
-                public mekanism.api.chemical.ChemicalStack getChemicalInTank(int tank) {
-                    if (tank != 0) {
-                        return mekanism.api.chemical.ChemicalStack.EMPTY;
-                    }
-                    // 蓄水池中数量最多的化学物预览（Jade/管道能看到真实化学物与数量）
-                    var best = largestChemical();
-                    if (best == null) {
-                        return mekanism.api.chemical.ChemicalStack.EMPTY;
-                    }
-                    var mk = com.ae2addon.compat.MekanismGasCompat.mekKeyOf(best.getKey());
-                    if (mk == null) {
-                        return mekanism.api.chemical.ChemicalStack.EMPTY;
-                    }
-                    long amt = best.getValue().min(BigInteger.valueOf(Integer.MAX_VALUE)).longValue();
-                    return mk.getStack().copyWithAmount(Math.max(1, amt));
-                }
+    /** 化学能力实例惰性创建（仅 getChemHandler 调用；Mekanism 未加载时永不触发）。 */
+    @Nullable
+    private Object chemHandler() {
+        if (networkChemicalHandler == null
+                && com.ae2addon.compat.MekanismGasCompat.isLoaded()) {
+            networkChemicalHandler = new ChemHandlerHolder(this);
+        }
+        return networkChemicalHandler;
+    }
 
-                @Override
-                public void setChemicalInTank(int tank, mekanism.api.chemical.ChemicalStack stack) {
-                    // 只读（蓄水池视图），忽略写入
-                }
+    /**
+     * 化学能力实现（静态内部类 = 惰性持有）。
+     * <p>
+     * 2026-09-20 上游同步（审计补漏 P0-6）：所有 mekanism 类型引用集中在此内部类，
+     * 由 chemHandler() 按需实例化（仅 Mekanism 加载时）。方块实体本身不再持有
+     * mekanism 类型的字段，构造期不解引用 mekanism 符号，杜绝无 Mekanism 环境下的
+     * NoClassDefFoundError。实现内部经 host 成员回指访问 BE 的蓄水池/网络（对外零变化）。
+     * 保持本地 1.21.1 统一 IChemicalHandler 路线（不分 Gas/Infusion/Pigment/Slurry 形态）。
+     */
+    private static final class ChemHandlerHolder implements mekanism.api.chemical.IChemicalHandler {
 
-                @Override
-                public long getChemicalTankCapacity(int tank) {
-                    return Integer.MAX_VALUE;
-                }
+        private final InfiniteInterfaceBE host;
 
-                @Override
-                public boolean isValid(int tank, mekanism.api.chemical.ChemicalStack stack) {
-                    return !stack.isEmpty();
-                }
+        ChemHandlerHolder(InfiniteInterfaceBE host) {
+            this.host = host;
+        }
 
-                @Override
-                public mekanism.api.chemical.ChemicalStack insertChemical(int tank,
-                        mekanism.api.chemical.ChemicalStack resource, mekanism.api.Action action) {
-                    return insertChemical(resource, action);
-                }
+        @Override
+        public int getChemicalTanks() {
+            return 1;
+        }
 
-                @Override
-                public mekanism.api.chemical.ChemicalStack extractChemical(int tank, long amount,
-                        mekanism.api.Action action) {
-                    return extractChemical(amount, action);
-                }
+        @Override
+        public mekanism.api.chemical.ChemicalStack getChemicalInTank(int tank) {
+            if (tank != 0) {
+                return mekanism.api.chemical.ChemicalStack.EMPTY;
+            }
+            // 蓄水池中数量最多的化学物预览（Jade/管道能看到真实化学物与数量）
+            var best = this.host.largestChemical();
+            if (best == null) {
+                return mekanism.api.chemical.ChemicalStack.EMPTY;
+            }
+            var mk = com.ae2addon.compat.MekanismChemCompat.mekKeyOf(best.getKey());
+            if (mk == null) {
+                return mekanism.api.chemical.ChemicalStack.EMPTY;
+            }
+            long amt = best.getValue().min(BigInteger.valueOf(Integer.MAX_VALUE)).longValue();
+            return mk.getStack().copyWithAmount(Math.max(1, amt));
+        }
 
-                @Override
-                public mekanism.api.chemical.ChemicalStack insertChemical(
-                        mekanism.api.chemical.ChemicalStack resource, mekanism.api.Action action) {
-                    return insertChemToNetwork(resource, action);
-                }
+        @Override
+        public void setChemicalInTank(int tank, mekanism.api.chemical.ChemicalStack stack) {
+            // 只读（蓄水池视图），忽略写入
+        }
 
-                @Override
-                public mekanism.api.chemical.ChemicalStack extractChemical(long amount,
-                        mekanism.api.Action action) {
-                    if (amount <= 0) {
-                        return mekanism.api.chemical.ChemicalStack.EMPTY;
-                    }
-                    // 蓄水池中数量最多的化学物（管道无指定时的通用抽取）
-                    var best = largestChemical();
-                    if (best == null) {
-                        return mekanism.api.chemical.ChemicalStack.EMPTY;
-                    }
-                    var mk = com.ae2addon.compat.MekanismGasCompat.mekKeyOf(best.getKey());
-                    if (mk == null) {
-                        return mekanism.api.chemical.ChemicalStack.EMPTY;
-                    }
-                    long take = best.getValue().min(BigInteger.valueOf(amount))
-                            .min(BigInteger.valueOf(Integer.MAX_VALUE)).longValue();
-                    if (take <= 0) {
-                        return mekanism.api.chemical.ChemicalStack.EMPTY;
-                    }
-                    if (!action.simulate()) {
-                        subtractReservoir(best.getKey(), take);
-                        setChanged();
-                    }
-                    return mk.getStack().copyWithAmount(take);
-                }
+        @Override
+        public long getChemicalTankCapacity(int tank) {
+            return Integer.MAX_VALUE;
+        }
 
-                @Override
-                public mekanism.api.chemical.ChemicalStack extractChemical(
-                        mekanism.api.chemical.ChemicalStack stack, mekanism.api.Action action) {
-                    return extractChemFromReservoir(stack, action);
-                }
-            };
+        @Override
+        public boolean isValid(int tank, mekanism.api.chemical.ChemicalStack stack) {
+            return !stack.isEmpty();
+        }
+
+        @Override
+        public mekanism.api.chemical.ChemicalStack insertChemical(int tank,
+                mekanism.api.chemical.ChemicalStack resource, mekanism.api.Action action) {
+            return insertChemical(resource, action);
+        }
+
+        @Override
+        public mekanism.api.chemical.ChemicalStack extractChemical(int tank, long amount,
+                mekanism.api.Action action) {
+            return extractChemical(amount, action);
+        }
+
+        @Override
+        public mekanism.api.chemical.ChemicalStack insertChemical(
+                mekanism.api.chemical.ChemicalStack resource, mekanism.api.Action action) {
+            return this.host.insertChemToNetwork(resource, action);
+        }
+
+        @Override
+        public mekanism.api.chemical.ChemicalStack extractChemical(long amount,
+                mekanism.api.Action action) {
+            if (amount <= 0) {
+                return mekanism.api.chemical.ChemicalStack.EMPTY;
+            }
+            // 蓄水池中数量最多的化学物（管道无指定时的通用抽取）
+            var best = this.host.largestChemical();
+            if (best == null) {
+                return mekanism.api.chemical.ChemicalStack.EMPTY;
+            }
+            var mk = com.ae2addon.compat.MekanismChemCompat.mekKeyOf(best.getKey());
+            if (mk == null) {
+                return mekanism.api.chemical.ChemicalStack.EMPTY;
+            }
+            long take = best.getValue().min(BigInteger.valueOf(amount))
+                    .min(BigInteger.valueOf(Integer.MAX_VALUE)).longValue();
+            if (take <= 0) {
+                return mekanism.api.chemical.ChemicalStack.EMPTY;
+            }
+            if (!action.simulate()) {
+                this.host.subtractReservoir(best.getKey(), take);
+                this.host.setChanged();
+            }
+            return mk.getStack().copyWithAmount(take);
+        }
+
+        @Override
+        public mekanism.api.chemical.ChemicalStack extractChemical(
+                mekanism.api.chemical.ChemicalStack stack, mekanism.api.Action action) {
+            return this.host.extractChemFromReservoir(stack, action);
+        }
+    }
 
     /** 化学物塞入网络入口 → 直接进网络（返回剩余；Mekanism 10.7 统一化学物）。 */
     private mekanism.api.chemical.ChemicalStack insertChemToNetwork(
@@ -2164,7 +2535,7 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
             return resource;
         }
         try {
-            AEKey key = com.ae2addon.compat.MekanismGasCompat.keyOfChemical(resource);
+            AEKey key = com.ae2addon.compat.MekanismChemCompat.keyOfChemical(resource);
             if (key == null) {
                 return resource;
             }
@@ -2172,13 +2543,12 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                     key, resource.getAmount(),
                     action.simulate() ? Actionable.SIMULATE : Actionable.MODULATE,
                     actionSource);
-            if (inserted <= 0) {
-                return resource;
+            // 网络空间不足的余量：收进蓄水池待入网缓存（等空间自动补送），不拒收（2026-09-02 上游同步）
+            long rest = resource.getAmount() - inserted;
+            if (rest > 0 && !action.simulate()) {
+                cacheForNetwork(key, rest);
             }
-            if (inserted >= resource.getAmount()) {
-                return mekanism.api.chemical.ChemicalStack.EMPTY;
-            }
-            return resource.copyWithAmount(resource.getAmount() - inserted);
+            return mekanism.api.chemical.ChemicalStack.EMPTY; // 全接收（入网 + 缓存）
         } catch (RuntimeException e) {
             return resource;
         }
@@ -2190,7 +2560,7 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
         if (stack.isEmpty()) {
             return stack;
         }
-        AEKey key = com.ae2addon.compat.MekanismGasCompat.keyOfChemical(stack);
+        AEKey key = com.ae2addon.compat.MekanismChemCompat.keyOfChemical(stack);
         if (key == null) {
             return stack;
         }
@@ -2207,12 +2577,13 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
     }
 
     // （Mekanism 10.7 统一后不再分 INFUSION/PIGMENT/SLURRY handler；
-    //  三个旧形态入口已合并进上方 networkChemicalHandler）
+    //  三个旧形态入口已合并进 ChemHandlerHolder；2026-09-20 上游同步：审计补漏 P0-6 后
+    //  insertChemToNetwork/extractChemFromReservoir/largestChemical 仅由该内部类经 host 回指调用）
     /** 蓄水池中数量最多的化学物（Mekanism 10.7 统一化学物；侧面抽取预览/通用抽取用）。 */
     private Map.Entry<AEKey, BigInteger> largestChemical() {
         Map.Entry<AEKey, BigInteger> best = null;
         for (var entry : reservoir.entrySet()) {
-            if (com.ae2addon.compat.MekanismGasCompat.mekKeyOf(entry.getKey()) == null
+            if (com.ae2addon.compat.MekanismChemCompat.mekKeyOf(entry.getKey()) == null
                     || entry.getValue().signum() <= 0) {
                 continue;
             }
@@ -2256,7 +2627,9 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
      */
     public Object getChemHandler(@Nullable Direction side, BlockCapability<?, Direction> cap) {
         if (cap == mekanism.common.capabilities.Capabilities.CHEMICAL.block()) {
-            return networkChemicalHandler;
+            // 惰性创建（2026-09-20 上游同步：审计补漏 P0-6）——本方法仅被 AE2Addon
+            // 的 isLoaded 守卫分支调用，未加载 Mekanism 时永不执行到这里
+            return chemHandler();
         }
         return null;
     }
@@ -2306,15 +2679,12 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
                         key, stack.getCount(),
                         simulate ? Actionable.SIMULATE : Actionable.MODULATE,
                         actionSource);
-                if (inserted <= 0) {
-                    return stack;
+                // 网络空间不足的余量：收进蓄水池待入网缓存（等空间自动补送），不拒收（2026-09-02 上游同步）
+                long rest = stack.getCount() - inserted;
+                if (rest > 0 && !simulate) {
+                    cacheForNetwork(key, rest);
                 }
-                if (inserted >= stack.getCount()) {
-                    return ItemStack.EMPTY;
-                }
-                ItemStack rest = stack.copy();
-                rest.setCount(stack.getCount() - (int) inserted);
-                return rest;
+                return ItemStack.EMPTY; // 全接收（入网 + 缓存）
             } catch (RuntimeException e) {
                 return stack;
             }
@@ -2413,6 +2783,14 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
         }
         tag.put("reservoir", reservoirList);
         tag.putString("totalFed", totalFed.toString());
+        // 待入网缓存标记（2026-09-02 上游同步）：重启后这些条目仍不喂机器，等网络空间补送
+        ListTag pendingList = new ListTag();
+        for (AEKey key : pendingNetworkKeys) {
+            CompoundTag ent = new CompoundTag();
+            ent.put("key", key.toTagGeneric(registries));
+            pendingList.add(ent);
+        }
+        tag.put("pendingNetwork", pendingList);
         upgrades.writeToNBT(tag, "upgrades", registries);
     }
 
@@ -2491,6 +2869,19 @@ public class InfiniteInterfaceBE extends AENetworkedBlockEntity
             totalFed = new BigInteger(tag.getString("totalFed"));
         } catch (RuntimeException ignored) {
             totalFed = BigInteger.ZERO;
+        }
+        // 待入网缓存标记恢复（2026-09-02 上游同步）：重启后这些条目仍不喂机器，等网络空间补送
+        pendingNetworkKeys.clear();
+        ListTag pendingList = tag.getList("pendingNetwork", Tag.TAG_COMPOUND);
+        for (int i = 0; i < pendingList.size(); i++) {
+            CompoundTag entry = pendingList.getCompound(i);
+            try {
+                AEKey key = AEKey.fromTagGeneric(registries, entry.getCompound("key"));
+                if (key != null && reservoir.containsKey(key)) {
+                    pendingNetworkKeys.add(key);
+                }
+            } catch (RuntimeException ignored) {
+            }
         }
         upgrades.readFromNBT(tag, "upgrades", registries);
         updateChannelLink();

@@ -3,6 +3,7 @@ package com.ae2addon.init;
 import com.ae2addon.AE2Addon;
 import com.ae2addon.block.InfiniteCraftingStorageBlock;
 import com.ae2addon.block.InfiniteCoProcessingBlock;
+import com.ae2addon.block.AssemblerCoreBlock;
 import com.ae2addon.block.InfiniteInterfaceBlock;
 import com.ae2addon.block.IntegratedCPUBlock;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -40,5 +41,13 @@ public class ModBlocks {
     public static final DeferredHolder<Block, Block> INFINITE_INTERFACE = BLOCKS.register(
             "infinite_interface",
             InfiniteInterfaceBlock::new
+    );
+
+    // ── 无限级装配处理器（v0.3 M3，上游 v1.3.0 同步）──
+
+    /** 装配处理器核心 — crafting-unit 型，框架+核心成簇，声明虚拟结算样板白名单 */
+    public static final DeferredHolder<Block, Block> ASSEMBLER_CORE = BLOCKS.register(
+            "assembler_core",
+            AssemblerCoreBlock::new
     );
 }

@@ -9,7 +9,11 @@ import com.ae2addon.init.ModBlockEntities;
 import com.ae2addon.mixin.CraftingCPUClusterAccessor;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponentMap;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.item.component.CustomData;
+import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import org.jetbrains.annotations.Nullable;
 
@@ -369,5 +373,48 @@ public class IntegratedCPUBE extends CraftingBlockEntity {
         super.loadTag(tag, registries);
         formed = tag.getBoolean("formed");
         hasCoProcessing = tag.getBoolean("hasCo");
+    }
+
+    // ── 1.21 组件钩子：把 formed/hasCo 摊成 CUSTOM_DATA 组件，供战利品表 copy_components 抄取 ──
+    // 2026-09-20 本地恢复上游 copy_nbt 语义：
+    // 1.20.1 的 integrated_cpu 战利品表用 minecraft:copy_nbt 把这两个布尔从方块实体抄进掉落物；
+    // 1.21 的等效函数 minecraft:copy_components（source=block_entity）只读 BlockEntity.collectComponents()，
+    // 而它 = this.components 加上本类的 collectImplicitComponents(builder)。原先没有覆写钩子 →
+    // 抄到空 map → 拆掉再放 formed/hasCo 双双归零 → 方块完全不接网，必须重跑木棍成型仪式。
+    // 键名与 saveAdditional/loadTag 保持一致，旧存档与旧掉落物都能读。
+    // 范式同 vanilla DecoratedPotBlockEntity / BeehiveBlockEntity。
+    //
+    // 已知宽松点（与上游 copy_nbt 相同）：抄的是“当时是不是成型态”这个结论，
+    // 放下时不再校验结构是否真实存在，因此会把成型态带到任何位置。
+
+    @Override
+    protected void collectImplicitComponents(DataComponentMap.Builder builder) {
+        super.collectImplicitComponents(builder);
+        var tag = new CompoundTag();
+        tag.putBoolean("formed", formed);
+        tag.putBoolean("hasCo", hasCoProcessing);
+        builder.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
+    }
+
+    @Override
+    protected void applyImplicitComponents(BlockEntity.DataComponentInput input) {
+        super.applyImplicitComponents(input);
+        var data = input.getOrDefault(DataComponents.CUSTOM_DATA, CustomData.EMPTY);
+        var tag = data.copyTag();
+        formed = tag.getBoolean("formed");
+        hasCoProcessing = tag.getBoolean("hasCo");
+    }
+
+    /**
+     * BeehiveBlockEntity 同款：物品化（BlockEntity.saveToItem）时把这两个键从 BE 自身 NBT 里摘掉，
+     * 避免与上面的 CUSTOM_DATA 组件两处重复——saveToItem 紧接着就会用 collectComponents() 补组件。
+     * 世界存档走 saveAdditional，不经过这里，formed/hasCo 照常落盘。
+     */
+    @Override
+    @SuppressWarnings("deprecation")
+    public void removeComponentsFromTag(CompoundTag tag) {
+        super.removeComponentsFromTag(tag);
+        tag.remove("formed");
+        tag.remove("hasCo");
     }
 }

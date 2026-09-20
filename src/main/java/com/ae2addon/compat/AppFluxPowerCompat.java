@@ -18,6 +18,8 @@ import net.neoforged.neoforge.energy.IEnergyStorage;
  * <p>
  * 感应卡（appflux:induction_card）插入接口后：每 tick 从网络 FE 存储
  * （NetworkFEPower）给正面机器的 IEnergyStorage 充能。
+ * 单轮上限可配（feederPowerFeCap）+ 多轮叠加（feederPowerPassesPerTick），
+ * 速度卡再乘倍率（1 张 ×16，2 张每轮灌满缺口）——2026-09-08 上游同步。
  * <p>
  * compileOnly 依赖（appflux），运行时未装 AppFlux 时短路。
  * <p>
@@ -31,8 +33,6 @@ public final class AppFluxPowerCompat {
 
     private static boolean checked;
     private static boolean loaded;
-    /** 每 tick 供电上限（FE；防单 tick 卡顿，可再调）。 */
-    private static final long MAX_FE_PER_TICK = 100_000_000L;
 
     private AppFluxPowerCompat() {
     }
@@ -54,10 +54,45 @@ public final class AppFluxPowerCompat {
                 ResourceLocation.fromNamespaceAndPath("appflux", "induction_card"));
     }
 
-    /** 给机器充能：网络 FE → 机器能量槽；返回本次实际传输 FE。 */
+    /** 给机器充能（多轮，可配单轮上限）：网络 FE → 机器能量槽；返回本次实际传输 FE。 */
+    public static long feedEnergy(BlockEntity target, Direction side,
+            appeng.api.networking.IGrid grid, IActionSource source, int passes, long perPassCap) {
+        if (!isLoaded() || target == null || grid == null || passes <= 0) {
+            return 0;
+        }
+        long total = 0;
+        try {
+            for (int i = 0; i < passes; i++) {
+                long fe = feedEnergyOnce(target, side, grid, source, perPassCap);
+                total += fe;
+                if (fe <= 0) {
+                    break; // 机器满了/网络空/不可收，继续轮无意义
+                }
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return total;
+    }
+
+    /** 给机器充能（多轮，默认每轮无上限）；兼容旧调用。 */
+    public static long feedEnergy(BlockEntity target, Direction side,
+            appeng.api.networking.IGrid grid, IActionSource source, int passes) {
+        return feedEnergy(target, side, grid, source, passes, Long.MAX_VALUE);
+    }
+
+    /** 给机器充能（单轮）；保留原签名兼容旧调用。 */
     public static long feedEnergy(BlockEntity target, Direction side,
             appeng.api.networking.IGrid grid, IActionSource source) {
-        if (!isLoaded() || target == null || grid == null) {
+        return feedEnergy(target, side, grid, source, 1, Long.MAX_VALUE);
+    }
+
+    /**
+     * 单轮充能：上限 perPassCap（long；≥ int.MAX 等效无上限）。
+     * 机器能量槽是 int 容量，缺口本身 ≤ int max；cap 超过缺口时等价灌满缺口。
+     */
+    private static long feedEnergyOnce(BlockEntity target, Direction side,
+            appeng.api.networking.IGrid grid, IActionSource source, long perPassCap) {
+        if (!isLoaded() || target == null || grid == null || perPassCap <= 0) {
             return 0;
         }
         try {
@@ -83,14 +118,18 @@ public final class AppFluxPowerCompat {
                 }
                 return 0;
             }
+            int gap = machine.getMaxEnergyStored() - machine.getEnergyStored();
             if (System.getProperty("ae2addon.debugPower") != null) {
                 com.ae2addon.AE2Addon.LOGGER.info(
-                        "[ae2addon][feeder] 供电诊断: networkEnergy={} canExtract={} stored={}/{} 上限={}FE/t",
+                        "[ae2addon][feeder] 供电诊断: networkEnergy={} canExtract={} stored={}/{} cap={}FE/轮",
                         networkEnergy, networkEnergy.canExtract(),
-                        machine.getEnergyStored(), machine.getMaxEnergyStored(), MAX_FE_PER_TICK);
+                        machine.getEnergyStored(), machine.getMaxEnergyStored(), perPassCap);
             }
-            int need = Math.min((int) MAX_FE_PER_TICK,
-                    machine.getMaxEnergyStored() - machine.getEnergyStored());
+            if (gap <= 0) {
+                return 0;
+            }
+            // 本轮上限（long）与机器缺口（int）取小；cap≥缺口时灌满缺口
+            int need = (int) Math.min((long) gap, perPassCap);
             if (need <= 0) {
                 return 0;
             }

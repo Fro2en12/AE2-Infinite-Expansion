@@ -1,7 +1,7 @@
 package com.ae2addon.util;
 
 import appeng.items.tools.MemoryCardItem;
-import com.ae2addon.block.InfiniteInterfaceBE;
+import com.ae2addon.block.FeederHost;
 import net.minecraft.core.HolderLookup;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.nbt.CompoundTag;
@@ -30,7 +30,7 @@ public final class MemoryCardHelper {
     }
 
     /** 复制（写入卡）：右键。返回 true=已处理。 */
-    public static boolean handleCopy(InfiniteInterfaceBE feeder, Player player, ItemStack card) {
+    public static boolean handleCopy(FeederHost feeder, Player player, ItemStack card) {
         if (feeder == null || player == null || card.isEmpty()) {
             return false;
         }
@@ -43,8 +43,8 @@ public final class MemoryCardHelper {
             notify(player, card, false);
             com.ae2addon.AE2Addon.LOGGER.info(
                     "[ae2addon] 配置卡复制: 参数=({},{},{}) 开关=({},{}) 方向={} 样板数={} 标记数={} 目标数={}",
-                    feeder.pStockTarget, feeder.pRestockInterval, feeder.pFeedBudget,
-                    feeder.activeExtract, feeder.activeFeed, feeder.extractSide,
+                    feeder.pStockTarget(), feeder.pRestockInterval(), feeder.pFeedBudget(),
+                    feeder.activeExtract(), feeder.activeFeed(), feeder.extractSide(),
                     cfg.getList("patterns", 10).size(), cfg.getList("markers", 10).size(),
                     cfg.getList("markerTargets", 10).size());
         } catch (RuntimeException e) {
@@ -54,7 +54,7 @@ public final class MemoryCardHelper {
     }
 
     /** 粘贴（读取卡 → 写入接口）：shift+右键。返回 true=已处理。 */
-    public static boolean handlePaste(InfiniteInterfaceBE feeder, Player player, ItemStack card) {
+    public static boolean handlePaste(FeederHost feeder, Player player, ItemStack card) {
         if (feeder == null || player == null || card.isEmpty()) {
             return false;
         }
@@ -70,8 +70,8 @@ public final class MemoryCardHelper {
             notify(player, card, true);
             com.ae2addon.AE2Addon.LOGGER.info(
                     "[ae2addon] 配置卡粘贴: 参数=({},{},{}) 开关=({},{}) 方向={} 样板数={} 标记数={} 目标数={}",
-                    feeder.pStockTarget, feeder.pRestockInterval, feeder.pFeedBudget,
-                    feeder.activeExtract, feeder.activeFeed, feeder.extractSide,
+                    feeder.pStockTarget(), feeder.pRestockInterval(), feeder.pFeedBudget(),
+                    feeder.activeExtract(), feeder.activeFeed(), feeder.extractSide(),
                     cfg.getList("patterns", 10).size(), cfg.getList("markers", 10).size(),
                     cfg.getList("markerTargets", 10).size());
         } catch (RuntimeException e) {
@@ -92,7 +92,7 @@ public final class MemoryCardHelper {
         }
     }
 
-    private static void exportConfig(InfiniteInterfaceBE feeder, CompoundTag cfg, HolderLookup.Provider registries) {
+    private static void exportConfig(FeederHost feeder, CompoundTag cfg, HolderLookup.Provider registries) {
         // 样板槽（编码样板物品完整 NBT——样板定义直接转移，无需空白样板）
         ListTag patternList = new ListTag();
         var patternInv = feeder.getPatternInventory();
@@ -119,12 +119,12 @@ public final class MemoryCardHelper {
             }
         }
         cfg.put("upgrades", upgradeList);
-        cfg.putLong("pStockTarget", feeder.pStockTarget);
-        cfg.putInt("pRestockInterval", feeder.pRestockInterval);
-        cfg.putInt("pFeedBudget", feeder.pFeedBudget);
-        cfg.putBoolean("activeExtract", feeder.activeExtract);
-        cfg.putBoolean("activeFeed", feeder.activeFeed);
-        cfg.putString("extractSide", feeder.extractSide.name());
+        cfg.putLong("pStockTarget", feeder.pStockTarget());
+        cfg.putInt("pRestockInterval", feeder.pRestockInterval());
+        cfg.putInt("pFeedBudget", feeder.pFeedBudget());
+        cfg.putBoolean("activeExtract", feeder.activeExtract());
+        cfg.putBoolean("activeFeed", feeder.activeFeed());
+        cfg.putString("extractSide", feeder.extractSide().name());
         // 标记槽（虚拟标记）
         ListTag markerList = new ListTag();
         var markerInv = feeder.getMarkerInventory();
@@ -149,7 +149,7 @@ public final class MemoryCardHelper {
         cfg.put("markerTargets", targetList);
     }
 
-    private static void importConfig(InfiniteInterfaceBE feeder, CompoundTag cfg, HolderLookup.Provider registries) {
+    private static void importConfig(FeederHost feeder, CompoundTag cfg, HolderLookup.Provider registries) {
         // 样板槽恢复（先清空再写入；编码样板 NBT 直接重建物品）
         var patternInv = feeder.getPatternInventory();
         patternInv.clearContent();
@@ -176,13 +176,13 @@ public final class MemoryCardHelper {
                 upgrades.setItemDirect(slot, st);
             }
         }
-        feeder.pStockTarget = cfg.getLong("pStockTarget");
-        feeder.pRestockInterval = cfg.getInt("pRestockInterval");
-        feeder.pFeedBudget = cfg.getInt("pFeedBudget");
-        feeder.activeExtract = cfg.getBoolean("activeExtract");
-        feeder.activeFeed = cfg.getBoolean("activeFeed");
+        feeder.pStockTarget(cfg.getLong("pStockTarget"));
+        feeder.pRestockInterval(cfg.getInt("pRestockInterval"));
+        feeder.pFeedBudget(cfg.getInt("pFeedBudget"));
+        feeder.setActiveExtract(cfg.getBoolean("activeExtract"));
+        feeder.setActiveFeed(cfg.getBoolean("activeFeed"));
         try {
-            feeder.extractSide = appeng.api.orientation.RelativeSide.valueOf(cfg.getString("extractSide"));
+            feeder.setExtractSide(appeng.api.orientation.RelativeSide.valueOf(cfg.getString("extractSide")));
         } catch (RuntimeException ignored) {
         }
         // 标记

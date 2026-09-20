@@ -62,6 +62,21 @@ public class ModItems {
             () -> new BlockItem(ModBlocks.INFINITE_INTERFACE.get(), new Item.Properties())
     );
 
+    /** 装配处理器核心方块物品（v0.3 M3，上游 v1.3.0 同步） */
+    public static final DeferredHolder<Item, Item> ASSEMBLER_CORE_ITEM = ITEMS.register(
+            "assembler_core",
+            () -> new BlockItem(ModBlocks.ASSEMBLER_CORE.get(), new Item.Properties())
+    );
+
+    /** ME接口（无限级）· 线缆面板（part，2026-09-02 sensei：装线缆上喂机器，不占格；上游 v1.3.0 同步） */
+    public static final DeferredHolder<Item, Item> INFINITE_INTERFACE_PANEL_ITEM = ITEMS.register(
+            "infinite_interface_panel",
+            () -> new appeng.items.parts.PartItem<>(
+                    new Item.Properties(),
+                    com.ae2addon.part.InfiniteInterfacePart.class,
+                    partItem -> new com.ae2addon.part.InfiniteInterfacePart(partItem))
+    );
+
     /** 配置存储卡 */
     public static final DeferredHolder<Item, Item> CONFIG_CARD = ITEMS.register(
             "config_card",
@@ -80,7 +95,9 @@ public class ModItems {
                         output.accept(ModBlocks.INFINITE_CRAFTING_STORAGE.get());
                         output.accept(ModBlocks.INFINITE_CO_PROCESSING.get());
                         output.accept(ModBlocks.INTEGRATED_CPU.get());
+                        output.accept(ModBlocks.ASSEMBLER_CORE.get());
                         output.accept(ModBlocks.INFINITE_INTERFACE.get());
+                        output.accept(INFINITE_INTERFACE_PANEL_ITEM.get());
                         output.accept(CONFIG_CARD.get());
                         output.accept(MATTER_BALL.get());
                     })

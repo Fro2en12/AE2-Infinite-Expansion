@@ -37,8 +37,9 @@ public record FeederTogglePacket(BlockPos pos, String which) implements CustomPa
         context.enqueueWork(() -> {
             var level = context.player().level();
             if (!level.hasChunkAt(msg.pos)) return;
-            if (level.getBlockEntity(msg.pos) instanceof com.ae2addon.block.InfiniteInterfaceBE be) {
-                be.toggleActive(msg.which);
+            var fh = com.ae2addon.network.FeederHostResolver.resolve(level, msg.pos);
+            if (fh != null) {
+                fh.toggleActive(msg.which);
             }
         });
     }

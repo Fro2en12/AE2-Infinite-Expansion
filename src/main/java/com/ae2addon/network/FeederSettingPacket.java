@@ -38,8 +38,9 @@ public record FeederSettingPacket(BlockPos pos, String key, long value) implemen
         context.enqueueWork(() -> {
             var level = context.player().level();
             if (!level.hasChunkAt(msg.pos)) return;
-            if (level.getBlockEntity(msg.pos) instanceof com.ae2addon.block.InfiniteInterfaceBE be) {
-                be.setPerBlockParam(msg.key, msg.value);
+            var fh = com.ae2addon.network.FeederHostResolver.resolve(level, msg.pos);
+            if (fh != null) {
+                fh.setPerBlockParam(msg.key, msg.value);
             }
         });
     }
