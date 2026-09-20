@@ -150,4 +150,15 @@ public final class MekanismChemCompat {
         }
         return null;
     }
+
+    /**
+     * 线缆面板 part 的化学能力注册（仅 {@link MekanismGasCompat#isLoaded()} 时由 AE2Addon 调用）。
+     * 放在本类里而不是 AE2Addon：主类不能出现可选依赖符号（2026-09-21 客户端崩溃教训）。
+     */
+    public static void registerPartCapabilities(appeng.api.parts.RegisterPartCapabilitiesEvent event) {
+        event.register(Capabilities.CHEMICAL.block(),
+                (com.ae2addon.part.InfiniteInterfacePart part, Direction side) ->
+                        (IChemicalHandler) part.getChemHandler(),
+                com.ae2addon.part.InfiniteInterfacePart.class);
+    }
 }

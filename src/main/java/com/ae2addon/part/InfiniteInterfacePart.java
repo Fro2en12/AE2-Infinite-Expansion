@@ -2446,8 +2446,15 @@ public class InfiniteInterfacePart extends AEBasePart
      * mekanism 符号全部关在静态内部类 {@link ChemHandlerHolder} 里，类加载与构造期都不解析
      * mekanism 类型（对齐方块版审计补漏 P0-6，避免无 Mekanism 环境 NoClassDefFoundError）。
      */
+    /**
+     * ⚠️ 返回类型必须是 Object（2026-09-21 客户端崩溃修复）：本类会被 AE2 的
+     * {@code PartModelsHelper.createModels()} 反射扫描 {@code getDeclaredMethods()}，
+     * 方法签名里出现可选依赖类会在未装 Mekanism 的客户端抛 NoClassDefFoundError
+     * （实测崩在 mod 构造期的 part 模型注册）。实际返回 mekanism 的
+     * IChemicalHandler，调用方在 isLoaded 守卫内自行转型。
+     */
     @Nullable
-    public mekanism.api.chemical.IChemicalHandler getChemHandler() {
+    public Object getChemHandler() {
         if (!com.ae2addon.compat.MekanismGasCompat.isLoaded()) {
             return null; // 未加载 Mekanism：无化学入口（也不触碰 mekanism 符号）
         }
@@ -2455,7 +2462,7 @@ public class InfiniteInterfacePart extends AEBasePart
             if (networkChemicalHandler == null) {
                 networkChemicalHandler = ChemHandlerHolder.create(this);
             }
-            return ChemHandlerHolder.asHandler(networkChemicalHandler);
+            return networkChemicalHandler;
         } catch (RuntimeException | LinkageError e) {
             return null; // 依赖缺失/环境异常：安全返回 null，不崩
         }
@@ -2488,12 +2495,8 @@ public class InfiniteInterfacePart extends AEBasePart
      */
     private static final class ChemHandlerHolder {
 
-        static mekanism.api.chemical.IChemicalHandler create(InfiniteInterfacePart host) {
+        static Object create(InfiniteInterfacePart host) {
             return new Impl(host);
-        }
-
-        static mekanism.api.chemical.IChemicalHandler asHandler(Object holder) {
-            return (mekanism.api.chemical.IChemicalHandler) holder;
         }
 
         private static final class Impl implements mekanism.api.chemical.IChemicalHandler {

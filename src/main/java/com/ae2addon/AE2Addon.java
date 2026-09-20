@@ -170,10 +170,8 @@ public class AE2Addon {
                         part.getNetworkFluidHandler(),
                 com.ae2addon.part.InfiniteInterfacePart.class);
         if (com.ae2addon.compat.MekanismGasCompat.isLoaded()) {
-            event.register(mekanism.common.capabilities.Capabilities.CHEMICAL.block(),
-                    (com.ae2addon.part.InfiniteInterfacePart part, net.minecraft.core.Direction side) ->
-                            (mekanism.api.chemical.IChemicalHandler) part.getChemHandler(),
-                    com.ae2addon.part.InfiniteInterfacePart.class);
+            // 化学注册在惰性门面里执行：主类不含可选依赖符号（未装 Mekanism 时该类不被加载）
+            com.ae2addon.compat.MekanismChemCompat.registerPartCapabilities(event);
         }
     }
 

@@ -25,7 +25,8 @@ public class ClientSetup {
                 var models = appeng.items.parts.PartModelsHelper
                         .createModels(com.ae2addon.part.InfiniteInterfacePart.class);
                 appeng.api.parts.PartModels.registerModels(models);
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
+                // NoClassDefFoundError 等 Error 也要吞掉：缺可选依赖时不能让客户端启不来
                 AE2Addon.LOGGER.warn("[ae2addon] part 模型注册失败: ", e);
             }
         });
